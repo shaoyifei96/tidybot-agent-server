@@ -309,6 +309,27 @@ class ArmAPI:
         if not success:
             raise ArmError("Failed to send emergency stop command")
 
+    # Home position for Franka Panda
+    HOME_POSITION = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+
+    def go_home(self, timeout: Optional[float] = None, duration: Optional[float] = None) -> None:
+        """Move arm to home position with smooth interpolation (blocking).
+
+        Home position: [0, -0.785, 0, -2.356, 0, 1.571, 0.785] radians
+
+        Args:
+            timeout: Max time to wait in seconds (default: 30s)
+            duration: Motion duration in seconds (default: auto-calculated)
+
+        Raises:
+            ArmError: If timeout or command fails
+
+        Example:
+            arm.go_home()
+            arm.go_home(duration=5.0)  # Slower motion
+        """
+        self.move_joints(self.HOME_POSITION, timeout=timeout, duration=duration)
+
     @staticmethod
     def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
         """Convert roll-pitch-yaw to rotation matrix."""
