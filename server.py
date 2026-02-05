@@ -22,7 +22,7 @@ from backends.base import BaseBackend
 from backends.cameras import CameraBackend
 from backends.franka import FrankaBackend
 from backends.gripper import GripperBackend
-from config import ServerConfig, ServiceManagerConfig, default_services
+from config import LeaseConfig, ServerConfig, ServiceManagerConfig, default_services
 from lease import LeaseManager
 from routes.ws import FeedbackBroadcaster
 from safety import SafetyEnvelope
@@ -96,6 +96,17 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
         motors_moving_fn=state_agg.motors_moving,
         on_lease_event=feedback.broadcast,
     )
+
+    # Wire lease-end callback: rewind to home + clear trajectory
+    if cfg.lease.reset_on_release:
+        async def _on_lease_end():
+            result = await rewind_orchestrator.reset_to_home()
+            if result.success or result.steps_rewound == 0:
+                system_logger.clear()
+            else:
+                logger.error("Lease-end reset failed: %s", result.error)
+
+        lease_mgr.set_on_lease_end(_on_lease_end)
 
     # -- routes --------------------------------------------------------------
     from routes.commands import create_router as cmd_router
@@ -206,6 +217,11 @@ def main():
         action="store_true",
         help="Disable service management entirely",
     )
+    parser.add_argument(
+        "--no-reset-on-release",
+        action="store_true",
+        help="Disable auto-rewind to home when lease ends",
+    )
     args = parser.parse_args()
 
     # Build server config
@@ -213,11 +229,16 @@ def main():
         enabled=not args.no_service_manager,
         auto_start=args.auto_start_services,
     )
+    lease_cfg = LeaseConfig()
+    if args.no_reset_on_release:
+        lease_cfg.reset_on_release = False
+
     cfg = ServerConfig(
         host=args.host,
         port=args.port,
         dry_run=args.dry_run,
         service_manager=svc_mgr_cfg,
+        lease=lease_cfg,
     )
 
     # Create service manager if enabled

@@ -198,6 +198,7 @@ class LeaseConfig:
     warning_grace_s: float = 10.0
     max_duration_s: float = 300.0
     check_interval_s: float = 1.0
+    reset_on_release: bool = True  # Auto-rewind to home when lease ends
 
 
 @dataclass

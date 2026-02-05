@@ -8,7 +8,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Awaitable
 
 from config import LeaseConfig
 
@@ -47,14 +47,31 @@ class LeaseManager:
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
+        # Reset-on-release state
+        self._resetting: bool = False
+        self._reset_task: asyncio.Task | None = None
+        self._on_lease_end_async: Callable[[], Awaitable[None]] | None = None
+
     @property
     def current_lease(self) -> Lease | None:
         return self._current
+
+    def set_on_lease_end(self, callback: Callable[[], Awaitable[None]]) -> None:
+        """Set async callback invoked when a lease ends (rewind + clear)."""
+        self._on_lease_end_async = callback
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._check_loop())
 
     async def stop(self) -> None:
+        if self._reset_task and not self._reset_task.done():
+            self._reset_task.cancel()
+            try:
+                await self._reset_task
+            except asyncio.CancelledError:
+                pass
+            self._resetting = False
+
         if self._task:
             self._task.cancel()
             try:
@@ -64,10 +81,10 @@ class LeaseManager:
 
     async def acquire(self, holder: str) -> dict:
         async with self._lock:
-            if self._current is None:
+            if self._current is None and not self._resetting:
                 return self._grant(holder)
             # Already holder?
-            if self._current.holder == holder:
+            if self._current and self._current.holder == holder:
                 return {
                     "status": "already_held",
                     "lease_id": self._current.lease_id,
@@ -87,9 +104,17 @@ class LeaseManager:
     async def release(self, lease_id: str) -> dict:
         async with self._lock:
             if self._current and self._current.lease_id == lease_id:
+                holder = self._current.holder
                 self._current = None
-                self._try_grant_next()
-                return {"status": "released"}
+                if self._cfg.reset_on_release and self._on_lease_end_async:
+                    self._resetting = True
+                    self._reset_task = asyncio.create_task(
+                        self._do_reset_and_grant()
+                    )
+                    return {"status": "released", "resetting": True}
+                else:
+                    self._try_grant_next()
+                    return {"status": "released", "resetting": False}
             return {"status": "not_found"}
 
     async def extend(self, lease_id: str) -> dict:
@@ -119,12 +144,14 @@ class LeaseManager:
                 "holder": None,
                 "queue_length": len(self._queue),
                 "queue": queue_list,
+                "resetting": self._resetting,
             }
         return {
             "holder": self._current.holder,
             "remaining_s": self._remaining(),
             "queue_length": len(self._queue),
             "queue": queue_list,
+            "resetting": self._resetting,
         }
 
     # -- internals -----------------------------------------------------------
@@ -168,13 +195,51 @@ class LeaseManager:
         self._on_event(event)
         logger.info("Lease revoked from %s: %s", self._current.holder, reason)
         self._current = None
-        self._try_grant_next()
+        if self._cfg.reset_on_release and self._on_lease_end_async:
+            self._resetting = True
+            self._reset_task = asyncio.create_task(
+                self._do_reset_and_grant()
+            )
+        else:
+            self._try_grant_next()
+
+    async def _do_reset_and_grant(self) -> None:
+        """Rewind to home, clear trajectory, then grant next queued client."""
+        try:
+            self._on_event({"type": "resetting_to_home"})
+            logger.info("Lease ended — resetting robot to home")
+
+            # Stop any running code execution
+            try:
+                from routes.code_routes import get_executor
+                executor = get_executor()
+                if executor.is_running:
+                    logger.info("Stopping running code execution before reset")
+                    executor.stop()
+            except Exception as e:
+                logger.warning("Failed to stop code executor: %s", e)
+
+            # Perform rewind + clear
+            await self._on_lease_end_async()
+
+            self._on_event({"type": "reset_complete"})
+            logger.info("Reset to home complete")
+        except asyncio.CancelledError:
+            logger.info("Reset to home cancelled")
+            raise
+        except Exception as e:
+            self._on_event({"type": "reset_failed", "error": str(e)})
+            logger.error("Reset to home failed: %s", e)
+        finally:
+            async with self._lock:
+                self._resetting = False
+                self._try_grant_next()
 
     async def _check_loop(self) -> None:
         while True:
             await asyncio.sleep(self._cfg.check_interval_s)
             async with self._lock:
-                if not self._current:
+                if not self._current or self._resetting:
                     continue
                 now = time.time()
 

@@ -63,12 +63,13 @@ class BaseAPI:
         Raises:
             BaseError: If command fails or timeout
         """
+        # Send command once — Ruckig (250 Hz internal loop) drives to target.
+        # Base server command timeout is 10s, so no need to re-send.
         try:
             self._backend.execute_action(x, y, theta)
         except BaseBackendError as e:
             raise BaseError(f"Failed to send base command: {e}") from e
 
-        # Wait for motion to complete by monitoring position
         timeout = timeout or self._timeout
         start_time = time.time()
 
@@ -81,7 +82,6 @@ class BaseAPI:
             pose = state.get("base_pose", [0.0, 0.0, 0.0])
             current_x, current_y, current_theta = pose
 
-            # Check if reached target
             pos_error = math.sqrt((current_x - x)**2 + (current_y - y)**2)
             angle_error = abs(self._normalize_angle(current_theta - theta))
 
