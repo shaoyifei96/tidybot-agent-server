@@ -48,7 +48,9 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
 
     @app.get("/")
     async def root():
-        return RedirectResponse(url="/services/dashboard")
+        if cfg.dashboard:
+            return RedirectResponse(url="/services/dashboard")
+        return {"status": "ok", "message": "TidyBot Hardware Server", "docs": "/docs"}
 
     # -- backends ------------------------------------------------------------
     base_backend = BaseBackend(cfg.base, dry_run=cfg.dry_run)
@@ -125,9 +127,10 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     app.include_router(init_code_routes(lease_mgr))
     app.include_router(sdk_docs_router)
 
-    # Service manager routes
-    from routes.service_routes import create_router as service_router
-    app.include_router(service_router(service_mgr))  # Pass None if disabled
+    # Service manager routes (includes dashboard)
+    if cfg.dashboard:
+        from routes.service_routes import create_router as service_router
+        app.include_router(service_router(service_mgr))  # Pass None if disabled
     if service_mgr is not None:
         # Wire up event broadcasting for service events
         service_mgr._on_event = feedback.broadcast
@@ -222,6 +225,11 @@ def main():
         action="store_true",
         help="Disable auto-rewind to home when lease ends",
     )
+    parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="Disable the web dashboard GUI entirely",
+    )
     args = parser.parse_args()
 
     # Build server config
@@ -239,6 +247,7 @@ def main():
         dry_run=args.dry_run,
         service_manager=svc_mgr_cfg,
         lease=lease_cfg,
+        dashboard=not args.no_dashboard,
     )
 
     # Create service manager if enabled

@@ -220,3 +220,4 @@ class ServerConfig:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
     service_manager: ServiceManagerConfig = field(default_factory=ServiceManagerConfig)
+    dashboard: bool = True
