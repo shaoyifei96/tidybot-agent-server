@@ -110,13 +110,21 @@ class LeaseManager:
         return self._current is not None and self._current.lease_id == lease_id
 
     def status(self) -> dict:
+        # Build queue list (only holder names, not futures)
+        queue_list = [{"position": i + 1, "holder": entry.holder}
+                      for i, entry in enumerate(self._queue)]
+
         if self._current is None:
-            return {"holder": None, "queue_length": len(self._queue)}
+            return {
+                "holder": None,
+                "queue_length": len(self._queue),
+                "queue": queue_list,
+            }
         return {
             "holder": self._current.holder,
-            "lease_id": self._current.lease_id,
             "remaining_s": self._remaining(),
             "queue_length": len(self._queue),
+            "queue": queue_list,
         }
 
     # -- internals -----------------------------------------------------------

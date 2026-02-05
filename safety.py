@@ -79,11 +79,20 @@ class SafetyEnvelope:
 
     # -- gripper -------------------------------------------------------------
 
-    def check_gripper_force(self, force: float) -> SafetyResult:
-        if force > self._cfg.gripper_max_force:
+    def check_gripper_force(self, force: int) -> SafetyResult:
+        """Check gripper force is within limits.
+
+        Args:
+            force: Gripper force in 0-255 scale (Robotiq-style)
+        """
+        # Convert 0-255 scale to approximate Newtons for limit check
+        # Robotiq 2F-85: 255 = ~235N max grip force
+        # We use a simple linear approximation
+        force_n = force / 255.0 * 235.0
+        if force_n > self._cfg.gripper_max_force:
             return SafetyResult(
                 False,
                 "force_limit",
-                f"gripper force {force:.1f} N exceeds limit {self._cfg.gripper_max_force}",
+                f"gripper force {force}/255 (~{force_n:.1f}N) exceeds limit {self._cfg.gripper_max_force}N",
             )
         return SafetyResult(True)

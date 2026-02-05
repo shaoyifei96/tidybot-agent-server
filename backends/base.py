@@ -20,6 +20,11 @@ class _BaseManager(multiprocessing.managers.BaseManager):
 _BaseManager.register("Base")
 
 
+class BaseBackendError(Exception):
+    """Raised when base backend is unavailable or connection fails."""
+    pass
+
+
 class BaseBackend:
     """Thin wrapper around BaseServer's multiprocessing RPC interface."""
 
@@ -28,6 +33,7 @@ class BaseBackend:
         self._dry_run = dry_run
         self._manager: _BaseManager | None = None
         self._base: Any = None
+        self._connected = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -41,6 +47,8 @@ class BaseBackend:
         )
         self._manager.connect()
         self._base = self._manager.Base()  # type: ignore[attr-defined]
+        # Initialize the vehicle if not already running (safe if controller already started)
+        self._base.ensure_initialized()
         logger.info("BaseBackend: connected to %s:%d", self._cfg.host, self._cfg.port)
 
     async def disconnect(self) -> None:
@@ -48,13 +56,28 @@ class BaseBackend:
         self._manager = None
         logger.info("BaseBackend: disconnected")
 
+    @property
+    def is_connected(self) -> bool:
+        """Return True if connected to base server."""
+        return self._dry_run or self._base is not None
+
     # -- queries -------------------------------------------------------------
 
     def get_state(self) -> dict:
-        """Return ``{'base_pose': [x, y, theta]}``."""
+        """Return ``{'base_pose': [x, y, theta]}``.
+
+        Raises:
+            BaseBackendError: If the connection to base_server is broken.
+        """
         if self._dry_run:
             return {"base_pose": [0.0, 0.0, 0.0]}
-        raw = self._base.get_state()
+        if self._base is None:
+            raise BaseBackendError("Base backend not connected")
+        try:
+            raw = self._base.get_state()
+        except (BrokenPipeError, EOFError, ConnectionResetError, OSError) as e:
+            self._base = None  # Mark as disconnected
+            raise BaseBackendError(f"Connection to base_server lost: {e}") from e
         pose = raw.get("base_pose")
         if isinstance(pose, np.ndarray):
             pose = pose.tolist()
@@ -62,24 +85,39 @@ class BaseBackend:
 
     # -- commands ------------------------------------------------------------
 
+    def _call_base(self, method_name: str, *args, **kwargs):
+        """Call a method on the base proxy, handling connection errors.
+
+        Raises:
+            BaseBackendError: If the connection to base_server is broken.
+        """
+        if self._base is None:
+            raise BaseBackendError("Base backend not connected")
+        try:
+            method = getattr(self._base, method_name)
+            return method(*args, **kwargs)
+        except (BrokenPipeError, EOFError, ConnectionResetError, OSError) as e:
+            self._base = None  # Mark as disconnected
+            raise BaseBackendError(f"Connection to base_server lost: {e}") from e
+
     def execute_action(self, x: float, y: float, theta: float) -> None:
         if self._dry_run:
             return
-        self._base.execute_action({"base_pose": np.array([x, y, theta])})
+        self._call_base("execute_action", {"base_pose": np.array([x, y, theta])})
 
     def set_target_velocity(
         self, vx: float, vy: float, wz: float, frame: str = "global"
     ) -> None:
         if self._dry_run:
             return
-        self._base.set_target_velocity([vx, vy, wz], frame=frame)
+        self._call_base("set_target_velocity", [vx, vy, wz], frame=frame)
 
     def stop(self) -> None:
         if self._dry_run:
             return
-        self._base.stop()
+        self._call_base("stop")
 
     def reset(self) -> None:
         if self._dry_run:
             return
-        self._base.reset()
+        self._call_base("reset")

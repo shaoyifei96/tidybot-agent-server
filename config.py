@@ -2,7 +2,138 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from typing import List, Optional
+
+
+# Root of the tidybot_army project
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@dataclass
+class ServiceDefinition:
+    """Definition of a managed backend service."""
+    name: str                          # display name
+    cmd: str                           # command to run
+    cwd: str                           # working directory
+    shell_prefix: str = ""             # e.g., "source /opt/ros/..."
+    kill_patterns: list[str] = field(default_factory=list)
+    auto_restart: bool = False
+    depends_on: list[str] = field(default_factory=list)  # service keys this depends on
+
+
+@dataclass
+class ServiceManagerConfig:
+    """Configuration for the service manager."""
+    enabled: bool = True
+    auto_start: bool = False           # start backends on server startup
+    log_max_lines: int = 100
+    health_check_interval_s: float = 5.0
+    pid_file: str = ".agent_server_pids.json"
+    services: dict[str, ServiceDefinition] = field(default_factory=dict)
+
+
+def default_services() -> dict[str, ServiceDefinition]:
+    """Return the default service definitions."""
+    _venv_activate = f"source {os.path.join(_PROJECT_ROOT, 'franka_interact', '.venv', 'bin', 'activate')} && "
+    return {
+        "unlock": ServiceDefinition(
+            name="Robot Unlock",
+            cmd="./lock_unlock.sh --unlock --fci --persistent --wait --force",
+            cwd=os.path.join(_PROJECT_ROOT, "franka_interact", "franka_server"),
+            shell_prefix=_venv_activate,
+            kill_patterns=["lock_unlock.sh", "desk_client"],
+        ),
+        "base_server": ServiceDefinition(
+            name="Base Server",
+            cmd="python3 -m base_server.server",
+            cwd=os.path.join(_PROJECT_ROOT, "base_server"),
+            kill_patterns=["base_server"],
+        ),
+        "franka_server": ServiceDefinition(
+            name="Franka Arm Server",
+            cmd="./start_server.sh",
+            cwd=os.path.join(_PROJECT_ROOT, "franka_interact", "franka_server"),
+            shell_prefix=_venv_activate,
+            kill_patterns=["start_server.sh", "franka_server.server"],
+            depends_on=["unlock"],
+        ),
+        "controller": ServiceDefinition(
+            name="Whole-Body Controller",
+            cmd="python3 -u qp_arm_only.py",
+            cwd=os.path.join(_PROJECT_ROOT, "tidybot2"),
+            shell_prefix=f"source {os.path.join(_PROJECT_ROOT, 'franka_ZMQ', '.venv_franka_interact', 'bin', 'activate')} && ",
+            kill_patterns=["qp_arm_only.py"],
+            depends_on=["base_server", "franka_server"],
+        ),
+        "gripper_server": ServiceDefinition(
+            name="Gripper Server",
+            cmd="python3 -m gripper_server.server",
+            cwd=os.path.join(_PROJECT_ROOT, "gripper_server"),
+            shell_prefix=_venv_activate,
+            kill_patterns=["gripper_server"],
+        ),
+        "camera_server": ServiceDefinition(
+            name="Camera Server",
+            cmd="python3 -m camera_server.server",
+            cwd=os.path.join(_PROJECT_ROOT, "camera_server"),
+            shell_prefix=_venv_activate,
+            kill_patterns=["camera_server.server"],
+        ),
+    }
+
+
+def camera_server_service(
+    name: str,
+    port: int = 5580,
+    cameras: Optional[List[str]] = None,
+    config_file: Optional[str] = None,
+) -> ServiceDefinition:
+    """Create a ServiceDefinition for a camera server instance.
+    
+    Use this to add multiple camera server instances to the service manager.
+    
+    Args:
+        name: Service name (e.g., "camera_wrist", "camera_overhead")
+        port: WebSocket port for this instance
+        cameras: List of "name:serial" pairs (e.g., ["wrist_cam:123456"])
+        config_file: Path to config file (alternative to cameras list)
+        
+    Returns:
+        ServiceDefinition for this camera server instance
+        
+    Example:
+        # Add to default_services():
+        services = default_services()
+        services["camera_wrist"] = camera_server_service(
+            "Wrist Camera Server",
+            port=5580,
+            cameras=["wrist_cam:123456789"],
+        )
+        services["camera_overhead"] = camera_server_service(
+            "Overhead Camera Server",
+            port=5581,
+            cameras=["overhead_cam:987654321"],
+        )
+    """
+    _venv_activate = f"source {os.path.join(_PROJECT_ROOT, 'franka_interact', '.venv', 'bin', 'activate')} && "
+    
+    if config_file:
+        cmd = f"python3 -m camera_server.server --config {config_file}"
+    elif cameras:
+        cam_args = " ".join(cameras)
+        cmd = f"python3 -m camera_server.server --port {port} --cameras {cam_args}"
+    else:
+        cmd = f"python3 -m camera_server.server --port {port}"
+    
+    return ServiceDefinition(
+        name=name,
+        cmd=cmd,
+        cwd=os.path.join(_PROJECT_ROOT, "camera_server"),
+        shell_prefix=_venv_activate,
+        kill_patterns=["camera_server.server"],
+    )
 
 
 @dataclass
@@ -19,17 +150,30 @@ class FrankaBackendConfig:
     cmd_port: int = 5555
     state_port: int = 5556
     stream_port: int = 5557
-    gripper_cmd_port: int = 5560
-    gripper_state_port: int = 5561
 
 
 @dataclass
-class CameraConfig:
+class GripperBackendConfig:
+    host: str = "localhost"
+    cmd_port: int = 5570
+    state_port: int = 5571
+
+
+@dataclass
+class CameraBackendConfig:
+    """Configuration for camera backend (WebSocket client to camera_server)."""
     enabled: bool = False
-    devices: list[str] = field(default_factory=lambda: ["/dev/video0"])
-    width: int = 640
-    height: int = 480
-    fps: int = 30
+    host: str = "localhost"
+    port: int = 5580                    # camera_server WebSocket port
+    timeout: float = 10.0               # connection timeout
+    auto_subscribe: bool = True         # subscribe to streams on connect
+    streams: list[str] = field(default_factory=lambda: ["color"])
+    stream_fps: int = 15                # streaming FPS
+    quality: int = 80                   # JPEG quality for color frames
+
+
+# Backward compatibility alias
+CameraConfig = CameraBackendConfig
 
 
 @dataclass
@@ -38,8 +182,8 @@ class SafetyConfig:
     arm_workspace_min: list[float] = field(default_factory=lambda: [-0.8, -0.8, 0.0])
     arm_workspace_max: list[float] = field(default_factory=lambda: [0.8, 0.8, 1.2])
     # Base workspace bounding box [min, max] for x, y (meters)
-    base_workspace_min: list[float] = field(default_factory=lambda: [-5.0, -5.0])
-    base_workspace_max: list[float] = field(default_factory=lambda: [5.0, 5.0])
+    base_workspace_min: list[float] = field(default_factory=lambda: [-0.25, -0.25])
+    base_workspace_max: list[float] = field(default_factory=lambda: [0.25, 0.25])
     # Max velocities
     base_max_linear_vel: float = 0.5  # m/s
     base_max_angular_vel: float = 1.57  # rad/s
@@ -64,9 +208,14 @@ class ServerConfig:
     observer_state_hz: float = 10.0
     operator_state_hz: float = 100.0
     max_trajectory_length: int = 10000
+    trajectory_interval: float = 0.1  # Sampling interval in seconds (100ms)
+    trajectory_position_threshold: float = 0.05  # Min position change to record (meters)
+    trajectory_orientation_threshold: float = 0.1  # Min orientation change to record (radians)
 
     base: BaseBackendConfig = field(default_factory=BaseBackendConfig)
     franka: FrankaBackendConfig = field(default_factory=FrankaBackendConfig)
+    gripper: GripperBackendConfig = field(default_factory=GripperBackendConfig)
     cameras: CameraConfig = field(default_factory=CameraConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     lease: LeaseConfig = field(default_factory=LeaseConfig)
+    service_manager: ServiceManagerConfig = field(default_factory=ServiceManagerConfig)
