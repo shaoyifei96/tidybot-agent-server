@@ -62,11 +62,11 @@ def get_class_info(cls: type) -> dict:
 def generate_sdk_docs() -> dict:
     """Generate SDK documentation by introspecting robot_sdk module."""
     docs = {
-        "version": "1.0.0",
+        "version": "1.1.0",
         "description": "Robot SDK for code execution. Import these modules in submitted code.",
         "modules": {},
         "usage": {
-            "example": """from robot_sdk import arm, base, gripper, sensors
+            "example": """from robot_sdk import arm, base, gripper, sensors, rewind
 
 # Move arm
 arm.move_joints([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
@@ -74,12 +74,18 @@ arm.move_joints([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 # Read sensors
 joints = sensors.get_arm_joints()
 print(f"Current joints: {joints}")
+
+# Error recovery with rewind
+if rewind.is_out_of_bounds():
+    result = rewind.rewind_to_safe()
+    print(f"Rewound {result.steps_rewound} steps to safe position")
 """,
             "notes": [
                 "All methods are synchronous (blocking)",
                 "Methods raise exceptions on failure",
                 "Robot holds position when code stops (auto-hold)",
                 "Unavailable backends print warning but don't crash",
+                "Rewind coordinates arm and base together",
             ],
         },
     }
@@ -90,6 +96,7 @@ print(f"Current joints: {joints}")
         from robot_sdk.base import BaseAPI
         from robot_sdk.gripper import GripperAPI
         from robot_sdk.sensors import SensorAPI
+        from robot_sdk.rewind import RewindAPI
 
         docs["modules"]["arm"] = {
             "import": "from robot_sdk import arm",
@@ -113,6 +120,12 @@ print(f"Current joints: {joints}")
             "import": "from robot_sdk import sensors",
             "description": "Read-only sensor access - arm, base, gripper state",
             **get_class_info(SensorAPI),
+        }
+
+        docs["modules"]["rewind"] = {
+            "import": "from robot_sdk import rewind",
+            "description": "Trajectory reversal for error recovery - rewind arm and base together",
+            **get_class_info(RewindAPI),
         }
 
         # Add constants

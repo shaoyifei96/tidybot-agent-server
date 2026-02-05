@@ -114,10 +114,10 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     app.include_router(init_code_routes(lease_mgr))
     app.include_router(sdk_docs_router)
 
-    # Service manager routes (if enabled)
+    # Service manager routes
+    from routes.service_routes import create_router as service_router
+    app.include_router(service_router(service_mgr))  # Pass None if disabled
     if service_mgr is not None:
-        from routes.service_routes import create_router as service_router
-        app.include_router(service_router(service_mgr))
         # Wire up event broadcasting for service events
         service_mgr._on_event = feedback.broadcast
 

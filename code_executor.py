@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import os
@@ -9,10 +10,10 @@ import signal
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,221 @@ class ExecutionResult:
     error: str = ""
 
 
+@dataclass
+class CodeValidationResult:
+    """Result of code validation."""
+    valid: bool
+    errors: List[str] = field(default_factory=list)
+
+    def format_errors(self) -> str:
+        """Format errors as a readable string for client feedback."""
+        if not self.errors:
+            return ""
+        header = "Code validation failed. The following issues were found:\n"
+        items = "\n".join(f"  - {err}" for err in self.errors)
+        footer = "\n\nPlease fix these issues and resubmit."
+        return header + items + footer
+
+
+class CodeValidator:
+    """Basic static analysis to catch unintentional dangerous code.
+
+    This is NOT a security sandbox - it catches common mistakes from trusted
+    lab agents who may accidentally include dangerous operations.
+
+    Blocked categories:
+    - Shell command execution (subprocess, os.system)
+    - File deletion (os.remove, shutil.rmtree)
+    - Network access (socket, urllib, requests)
+    - Dynamic code execution (eval, exec, pickle)
+    - Process control (fork, kill, multiprocessing)
+    """
+
+    # Imports that agents almost certainly don't need
+    BLOCKED_IMPORTS = {
+        "subprocess",       # Shell commands
+        "shutil",           # rmtree, etc.
+        "pickle",           # Code execution via deserialization
+        "marshal",          # Same
+        "socket",           # Raw network access
+        "urllib",           # Network requests
+        "requests",         # Network requests
+        "httpx",            # Network requests
+        "aiohttp",          # Async network requests
+        "http",             # HTTP client/server
+        "ftplib",           # FTP
+        "smtplib",          # Email
+        "telnetlib",        # Telnet
+        "ctypes",           # C interop, memory access
+        "multiprocessing",  # Process spawning
+        "pty",              # Pseudo-terminal (shell access)
+        "pdb",              # Debugger (can execute arbitrary code)
+    }
+
+    # Dangerous function calls: (module, function) or (None, function) for builtins
+    BLOCKED_CALLS = {
+        # os module dangers - shell/process execution
+        ("os", "system"),
+        ("os", "popen"),
+        ("os", "popen2"),
+        ("os", "popen3"),
+        ("os", "popen4"),
+        ("os", "spawn"),
+        ("os", "spawnl"),
+        ("os", "spawnle"),
+        ("os", "spawnlp"),
+        ("os", "spawnlpe"),
+        ("os", "spawnv"),
+        ("os", "spawnve"),
+        ("os", "spawnvp"),
+        ("os", "spawnvpe"),
+        ("os", "execl"),
+        ("os", "execle"),
+        ("os", "execlp"),
+        ("os", "execlpe"),
+        ("os", "execv"),
+        ("os", "execve"),
+        ("os", "execvp"),
+        ("os", "execvpe"),
+        ("os", "fork"),
+        ("os", "forkpty"),
+        ("os", "kill"),
+        ("os", "killpg"),
+        # os module dangers - file deletion
+        ("os", "remove"),
+        ("os", "unlink"),
+        ("os", "rmdir"),
+        ("os", "removedirs"),
+        # Builtins - dynamic code execution
+        (None, "eval"),
+        (None, "exec"),
+        (None, "compile"),
+        (None, "__import__"),
+        # Builtins - file operations (open with write is checked separately)
+        (None, "input"),  # Can hang waiting for input
+    }
+
+    # Human-readable descriptions for blocked items
+    BLOCK_REASONS = {
+        "subprocess": "shell command execution",
+        "shutil": "file/directory operations (including deletion)",
+        "pickle": "code execution via deserialization",
+        "marshal": "code execution via deserialization",
+        "socket": "raw network access",
+        "urllib": "network requests",
+        "requests": "network requests",
+        "httpx": "network requests",
+        "aiohttp": "async network requests",
+        "http": "HTTP client/server",
+        "ftplib": "FTP access",
+        "smtplib": "email sending",
+        "telnetlib": "telnet access",
+        "ctypes": "C interop and memory access",
+        "multiprocessing": "process spawning",
+        "pty": "pseudo-terminal (shell access)",
+        "pdb": "debugger (can execute arbitrary code)",
+        "os.system": "shell command execution",
+        "os.popen": "shell command execution",
+        "os.fork": "process spawning",
+        "os.kill": "process termination",
+        "os.remove": "file deletion",
+        "os.unlink": "file deletion",
+        "os.rmdir": "directory deletion",
+        "eval": "dynamic code execution",
+        "exec": "dynamic code execution",
+        "compile": "dynamic code compilation",
+        "__import__": "dynamic module importing",
+        "input": "blocking user input (will hang)",
+    }
+
+    def validate(self, code: str) -> CodeValidationResult:
+        """Validate code for obvious dangerous patterns.
+
+        Args:
+            code: Python source code
+
+        Returns:
+            CodeValidationResult with valid=True/False and error messages
+        """
+        errors = []
+
+        # Parse the code (also catches syntax errors)
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return CodeValidationResult(
+                valid=False,
+                errors=[f"Syntax error at line {e.lineno}: {e.msg}"]
+            )
+
+        # Walk the AST looking for dangerous patterns
+        for node in ast.walk(tree):
+            # Check imports: import x, import x.y
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module = alias.name.split(".")[0]
+                    if module in self.BLOCKED_IMPORTS:
+                        reason = self.BLOCK_REASONS.get(module, "security risk")
+                        errors.append(
+                            f"Line {node.lineno}: 'import {alias.name}' is not allowed ({reason})"
+                        )
+
+            # Check imports: from x import y
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    module = node.module.split(".")[0]
+                    if module in self.BLOCKED_IMPORTS:
+                        reason = self.BLOCK_REASONS.get(module, "security risk")
+                        errors.append(
+                            f"Line {node.lineno}: 'from {node.module} import ...' is not allowed ({reason})"
+                        )
+
+            # Check function calls
+            elif isinstance(node, ast.Call):
+                call_info = self._get_call_info(node)
+                if call_info:
+                    module, func = call_info
+
+                    # Check module.function() calls (e.g., os.system)
+                    if module is not None and (module, func) in self.BLOCKED_CALLS:
+                        key = f"{module}.{func}"
+                        reason = self.BLOCK_REASONS.get(key, "security risk")
+                        errors.append(
+                            f"Line {node.lineno}: '{module}.{func}()' is not allowed ({reason})"
+                        )
+                    # Check builtin function calls (e.g., eval, exec)
+                    elif module is None and (None, func) in self.BLOCKED_CALLS:
+                        reason = self.BLOCK_REASONS.get(func, "security risk")
+                        errors.append(
+                            f"Line {node.lineno}: '{func}()' is not allowed ({reason})"
+                        )
+
+        return CodeValidationResult(
+            valid=len(errors) == 0,
+            errors=errors
+        )
+
+    def _get_call_info(self, node: ast.Call) -> Optional[Tuple[Optional[str], str]]:
+        """Extract (module, function) from a Call node.
+
+        Returns:
+            Tuple of (module_name, function_name) or (None, function_name) for builtins,
+            or None if cannot determine.
+        """
+        if isinstance(node.func, ast.Attribute):
+            # e.g., os.system() -> ("os", "system")
+            if isinstance(node.func.value, ast.Name):
+                return (node.func.value.id, node.func.attr)
+        elif isinstance(node.func, ast.Name):
+            # e.g., eval() -> (None, "eval")
+            return (None, node.func.id)
+        return None
+
+
+# Module-level validator instance
+_validator = CodeValidator()
+
+
 class CodeExecutor:
     """Manages subprocess execution of submitted code.
 
@@ -58,6 +274,20 @@ class CodeExecutor:
         """Check if code is currently executing."""
         return self._process is not None and self._process.poll() is None
 
+    def validate_code(self, code: str) -> CodeValidationResult:
+        """Validate code before execution.
+
+        Checks for dangerous patterns that trusted lab agents might
+        accidentally include. Not a security sandbox.
+
+        Args:
+            code: Python source code to validate
+
+        Returns:
+            CodeValidationResult with valid=True/False and error messages
+        """
+        return _validator.validate(code)
+
     @property
     def status(self) -> ExecutionStatus:
         """Get current execution status."""
@@ -74,6 +304,8 @@ class CodeExecutor:
         code: str,
         execution_id: str,
         timeout: float = 300.0,
+        lease_id: Optional[str] = None,
+        server_url: str = "http://localhost:8080",
     ) -> ExecutionResult:
         """Execute code in subprocess.
 
@@ -81,6 +313,8 @@ class CodeExecutor:
             code: Python code to execute
             execution_id: Unique ID for this execution
             timeout: Maximum execution time in seconds
+            lease_id: Lease ID for rewind authorization (optional)
+            server_url: Agent server URL for rewind API (default: http://localhost:8080)
 
         Returns:
             ExecutionResult with status, stdout, stderr, etc.
@@ -93,6 +327,8 @@ class CodeExecutor:
 
         self._execution_id = execution_id
         self._start_time = time.time()
+        self._lease_id = lease_id
+        self._server_url = server_url
 
         # Create temporary Python file with submitted code
         temp_file = self._create_temp_file(code)
@@ -112,8 +348,13 @@ class CodeExecutor:
             )
 
             # Wait for completion or timeout
+            # Use asyncio.to_thread to avoid blocking the event loop
+            # This allows the server to handle other requests (like rewind API calls
+            # from the subprocess) while waiting for the code to complete
             try:
-                stdout, stderr = self._process.communicate(timeout=timeout)
+                stdout, stderr = await asyncio.to_thread(
+                    self._process.communicate, timeout=timeout
+                )
                 exit_code = self._process.returncode
                 duration = time.time() - self._start_time
 
@@ -137,7 +378,7 @@ class CodeExecutor:
             except subprocess.TimeoutExpired:
                 # Kill process on timeout
                 self._process.kill()
-                stdout, stderr = self._process.communicate()
+                stdout, stderr = await asyncio.to_thread(self._process.communicate)
                 duration = time.time() - self._start_time
 
                 result = ExecutionResult(
@@ -275,7 +516,7 @@ franka_config = FrankaBackendConfig(
 base_config = BaseBackendConfig(
     host=os.getenv("BASE_IP", "localhost"),
     port=50000,
-    authkey=b"tidybot",
+    authkey=b"secret password",
 )
 
 gripper_config = GripperBackendConfig(
@@ -320,11 +561,19 @@ robot_sdk.base = BaseAPI(base_backend)
 robot_sdk.gripper = GripperAPI(gripper_backend)
 robot_sdk.sensors = SensorAPI(franka_backend, base_backend, gripper_backend)
 
+# Initialize rewind API (uses HTTP calls to agent server)
+from robot_sdk.rewind import RewindAPI
+server_url = os.getenv("ROBOT_SERVER_URL", "http://localhost:8080")
+lease_id = os.getenv("ROBOT_LEASE_ID")
+robot_sdk.rewind = RewindAPI(server_url=server_url, lease_id=lease_id)
+print(f"[SDK] Rewind API initialized (server: {{server_url}})")
+
 # Make them available for import
 arm = robot_sdk.arm
 base = robot_sdk.base
 gripper = robot_sdk.gripper
 sensors = robot_sdk.sensors
+rewind = robot_sdk.rewind
 
 # Also expose backends directly for advanced usage
 # (same pattern as rewind orchestrator uses)
@@ -358,7 +607,7 @@ asyncio.run(cleanup())
     def _get_env(self) -> dict:
         """Get environment variables for subprocess.
 
-        Returns current environment with Python path modifications.
+        Returns current environment with Python path modifications and SDK config.
         """
         env = os.environ.copy()
 
@@ -389,5 +638,11 @@ asyncio.run(cleanup())
         if python_path:
             paths.append(python_path)
         env["PYTHONPATH"] = ":".join(paths)
+
+        # Add lease ID and server URL for rewind API
+        if hasattr(self, "_lease_id") and self._lease_id:
+            env["ROBOT_LEASE_ID"] = self._lease_id
+        if hasattr(self, "_server_url") and self._server_url:
+            env["ROBOT_SERVER_URL"] = self._server_url
 
         return env

@@ -9,7 +9,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel, Field
 
-from code_executor import CodeExecutor, ExecutionResult, ExecutionStatus
+from code_executor import CodeExecutor, CodeValidationResult, ExecutionResult, ExecutionStatus
 from lease import LeaseManager
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ class CodeExecuteResponse(BaseModel):
     success: bool
     execution_id: str
     message: str = ""
+    validation_errors: Optional[list[str]] = None
 
 
 class CodeStatusResponse(BaseModel):
@@ -49,6 +50,18 @@ class CodeStopResponse(BaseModel):
     """Response from stop request."""
     success: bool
     message: str
+
+
+class CodeValidateRequest(BaseModel):
+    """Request to validate code without executing."""
+    code: str = Field(..., description="Python code to validate")
+
+
+class CodeValidateResponse(BaseModel):
+    """Response from code validation."""
+    valid: bool
+    errors: list[str] = []
+    message: str = ""
 
 
 # Module-level code executor instance (shared across routes)
@@ -95,6 +108,17 @@ def init_code_routes(lease_manager: LeaseManager):
                 detail="Code is already running. Stop it first with POST /code/stop"
             )
 
+        # Validate code before execution (catches dangerous patterns)
+        validation = executor.validate_code(body.code)
+        if not validation.valid:
+            logger.warning(f"Code validation failed for lease {x_lease_id}: {validation.errors}")
+            return CodeExecuteResponse(
+                success=False,
+                execution_id="",
+                message=validation.format_errors(),
+                validation_errors=validation.errors,
+            )
+
         # Generate execution ID
         execution_id = str(uuid.uuid4())[:8]
 
@@ -112,6 +136,7 @@ def init_code_routes(lease_manager: LeaseManager):
                     code=body.code,
                     execution_id=execution_id,
                     timeout=timeout,
+                    lease_id=x_lease_id,  # Pass lease for rewind API
                 )
                 logger.info(f"Code execution {execution_id} finished: {result.status}")
             except Exception as e:
@@ -126,6 +151,31 @@ def init_code_routes(lease_manager: LeaseManager):
             execution_id=execution_id,
             message=f"Code execution started (ID: {execution_id})",
         )
+
+    @router.post("/validate", response_model=CodeValidateResponse)
+    async def validate_code(body: CodeValidateRequest):
+        """Validate code without executing it.
+
+        Checks for dangerous patterns (shell commands, network access, file deletion, etc.)
+        that trusted lab agents might accidentally include.
+
+        No lease required. Use this to pre-check code before submitting to /execute.
+        """
+        executor = get_executor()
+        validation = executor.validate_code(body.code)
+
+        if validation.valid:
+            return CodeValidateResponse(
+                valid=True,
+                errors=[],
+                message="Code validation passed",
+            )
+        else:
+            return CodeValidateResponse(
+                valid=False,
+                errors=validation.errors,
+                message=validation.format_errors(),
+            )
 
     @router.post("/stop", response_model=CodeStopResponse)
     async def stop_code(x_lease_id: Optional[str] = Header(None)):

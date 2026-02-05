@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse
@@ -226,6 +227,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="logs-section" id="logs-section"></div>
 <p class="refresh-info">Auto-refreshes every 2 seconds</p>
 <script>
+let serviceManagerEnabled = true;  // Replaced by server when disabled
 let serviceKeys = [];
 function fmt(s) {
   if (s == null) return "—";
@@ -247,6 +249,19 @@ async function act(method, url, btn) {
 }
 
 async function poll() {
+  // Skip service polling if service manager is disabled
+  if (!serviceManagerEnabled) {
+    // Hide service-related sections
+    const tbl = document.querySelector("table");
+    if (tbl) tbl.style.display = "none";
+    const logsSection = document.getElementById("logs-section");
+    if (logsSection) logsSection.style.display = "none";
+    // Update subtitle
+    const subtitle = document.querySelector(".subtitle");
+    if (subtitle) subtitle.textContent = "TidyBot Agent Server — Service Manager Disabled";
+    return;
+  }
+
   try {
     const data = await (await fetch("/services")).json();
     let rows = "";
@@ -891,60 +906,78 @@ setInterval(pollRewindLogs, 1000);
 </script></body></html>"""
 
 
-def create_router(service_mgr: ServiceManager):
-    """Create the service routes with injected dependencies."""
+def create_router(service_mgr: ServiceManager | None):
+    """Create the service routes with injected dependencies.
+
+    Args:
+        service_mgr: ServiceManager instance, or None if service management is disabled.
+                     When None, only the dashboard route is available (without service controls).
+    """
+    service_manager_enabled = service_mgr is not None
 
     @router.get("/dashboard", response_class=HTMLResponse)
     async def dashboard():
         """Web dashboard for service management."""
-        return DASHBOARD_HTML
+        # Inject the service_manager_enabled flag into the HTML
+        html = DASHBOARD_HTML.replace(
+            "let serviceManagerEnabled = true;",
+            f"let serviceManagerEnabled = {'true' if service_manager_enabled else 'false'};"
+        )
+        return html
 
-    @router.get("")
-    async def list_services():
-        """List all services with status, PID, uptime."""
-        return service_mgr.get_status()
+    @router.get("/config")
+    async def get_config():
+        """Get dashboard configuration (service manager status, etc.)."""
+        return {"service_manager_enabled": service_manager_enabled}
 
-    @router.post("/unlock/lock")
-    async def lock_robot():
-        """Lock the robot by stopping the unlock service.
+    # Only add service management routes if service manager is enabled
+    if service_mgr is not None:
+        @router.get("")
+        async def list_services():
+            """List all services with status, PID, uptime."""
+            return service_mgr.get_status()
 
-        The unlock service runs with relock_on_exit=True and signal handlers,
-        so stopping it will automatically: deactivate FCI, lock brakes, release token.
-        """
-        await service_mgr.stop_service("unlock")
+        @router.post("/unlock/lock")
+        async def lock_robot():
+            """Lock the robot by stopping the unlock service.
 
-        state = service_mgr._services.get("unlock")
-        if state:
-            state.logs.append("[lock: stopped unlock service, cleanup will lock robot]")
+            The unlock service runs with relock_on_exit=True and signal handlers,
+            so stopping it will automatically: deactivate FCI, lock brakes, release token.
+            """
+            await service_mgr.stop_service("unlock")
 
-        return {"ok": True, "message": "Robot locked (unlock service stopped)"}
+            state = service_mgr._services.get("unlock")
+            if state:
+                state.logs.append("[lock: stopped unlock service, cleanup will lock robot]")
 
-    @router.get("/{name}")
-    async def get_service(name: str):
-        """Get status of a specific service."""
-        result = service_mgr.get_status(name)
-        if "error" in result:
-            return {"ok": False, **result}
-        return result
+            return {"ok": True, "message": "Robot locked (unlock service stopped)"}
 
-    @router.post("/{name}/start")
-    async def start_service(name: str):
-        """Start a service."""
-        return await service_mgr.start_service(name)
+        @router.get("/{name}")
+        async def get_service(name: str):
+            """Get status of a specific service."""
+            result = service_mgr.get_status(name)
+            if "error" in result:
+                return {"ok": False, **result}
+            return result
 
-    @router.post("/{name}/stop")
-    async def stop_service(name: str):
-        """Stop a service."""
-        return await service_mgr.stop_service(name)
+        @router.post("/{name}/start")
+        async def start_service(name: str):
+            """Start a service."""
+            return await service_mgr.start_service(name)
 
-    @router.post("/{name}/restart")
-    async def restart_service(name: str):
-        """Restart a service."""
-        return await service_mgr.restart_service(name)
+        @router.post("/{name}/stop")
+        async def stop_service(name: str):
+            """Stop a service."""
+            return await service_mgr.stop_service(name)
 
-    @router.get("/{name}/logs")
-    async def get_logs(name: str, lines: int = Query(default=50, ge=1, le=1000)):
-        """Get recent log output for a service."""
-        return service_mgr.get_logs(name, lines=lines)
+        @router.post("/{name}/restart")
+        async def restart_service(name: str):
+            """Restart a service."""
+            return await service_mgr.restart_service(name)
+
+        @router.get("/{name}/logs")
+        async def get_logs(name: str, lines: int = Query(default=50, ge=1, le=1000)):
+            """Get recent log output for a service."""
+            return service_mgr.get_logs(name, lines=lines)
 
     return router

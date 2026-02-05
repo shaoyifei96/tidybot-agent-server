@@ -4,7 +4,7 @@ This package provides a simplified API for external agents to control the robot.
 Code submitted via /code/execute runs in a subprocess with access to these modules.
 
 Example usage:
-    from robot_sdk import arm, base, gripper
+    from robot_sdk import arm, base, gripper, rewind
     import time
 
     # Move arm to position
@@ -16,17 +16,23 @@ Example usage:
 
     # Move base forward
     base.move_delta(dx=0.5, frame="local")
+
+    # Rewind if something goes wrong
+    if rewind.is_out_of_bounds():
+        rewind.rewind_to_safe()
 """
 
 from robot_sdk.arm import ArmAPI
 from robot_sdk.base import BaseAPI
 from robot_sdk.gripper import GripperAPI
 from robot_sdk.sensors import SensorAPI
+from robot_sdk.rewind import RewindAPI
 
 # Global instances (initialized by CodeExecutor before running submitted code)
 arm: ArmAPI = None  # type: ignore
 base: BaseAPI = None  # type: ignore
 gripper: GripperAPI = None  # type: ignore
 sensors: SensorAPI = None  # type: ignore
+rewind: RewindAPI = None  # type: ignore
 
-__all__ = ["arm", "base", "gripper", "sensors", "ArmAPI", "BaseAPI", "GripperAPI", "SensorAPI"]
+__all__ = ["arm", "base", "gripper", "sensors", "rewind", "ArmAPI", "BaseAPI", "GripperAPI", "SensorAPI", "RewindAPI"]

@@ -49,54 +49,100 @@ class ArmAPI:
         self._backend = backend
         self._timeout = 30.0  # Default timeout for blocking operations
         self._command_rate = 50.0  # Hz for streaming commands
+        self._default_duration = 3.0  # Default motion duration in seconds
 
-    def move_joints(self, q: list[float], timeout: Optional[float] = None) -> None:
-        """Move arm to joint positions (blocking).
+    @staticmethod
+    def _cubic_ease_in_out(t: float) -> float:
+        """Cubic ease-in-out interpolation for smooth motion."""
+        if t < 0.5:
+            return 4 * t * t * t
+        else:
+            return 1 - pow(-2 * t + 2, 3) / 2
 
-        Sends commands at 50 Hz until target is reached or timeout.
-        Automatically sets control mode to JOINT_POSITION.
+    def move_joints(
+        self,
+        q: list[float],
+        timeout: Optional[float] = None,
+        duration: Optional[float] = None,
+    ) -> None:
+        """Move arm to joint positions with smooth interpolation (blocking).
+
+        Interpolates from current position to target using cubic ease-in-out
+        for smooth, jerk-free motion. Sends commands at 50 Hz.
 
         Args:
             q: List of 7 joint angles in radians.
                Home position: [0, -0.785, 0, -2.356, 0, 1.571, 0.785]
             timeout: Max time to wait in seconds (default: 30s)
+            duration: Motion duration in seconds (default: 3s, auto-adjusts for large moves)
 
         Raises:
             ArmError: If timeout or command fails
 
         Example:
             arm.move_joints([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
+            arm.move_joints(target, duration=5.0)  # Slower 5-second motion
         """
         if len(q) != 7:
             raise ArmError(f"Expected 7 joint angles, got {len(q)}")
 
         timeout = timeout or self._timeout
 
-        # Set control mode to JOINT_POSITION
+        # Set control mode first and wait for it to take effect
         self._backend.set_control_mode(self.MODE_JOINT_POSITION)
-        time.sleep(0.05)  # Brief delay for mode switch
+        time.sleep(0.1)  # Wait for mode switch
 
-        # Send commands continuously (like rewind does) until target reached
+        # Get fresh current position (read multiple times to ensure fresh)
+        for _ in range(3):
+            state = self._backend.get_state()
+            time.sleep(0.02)
+        start_q = state.get("q", [0.0] * 7)
+
+        # Calculate max joint displacement
+        max_delta = max(abs(q[i] - start_q[i]) for i in range(7))
+
+        # Auto-adjust duration: slower to prevent velocity violations
+        # At least 2 seconds per 0.5 rad (30 deg), minimum 2s
+        if duration is None:
+            duration = max(2.0, min(15.0, max_delta / 0.5 * 4.0))
+
+        # Send current position first to establish command stream (avoids jump)
+        for _ in range(5):
+            self._backend.send_joint_position(start_q, blocking=False)
+            time.sleep(0.02)
+
+        # Interpolate smoothly from start to target
         command_interval = 1.0 / self._command_rate
-        start_time = time.time()
+        motion_start_time = time.time()
+        start_time = motion_start_time
 
         while time.time() - start_time < timeout:
-            # Send command
-            self._backend.send_joint_position(q, blocking=False)
+            elapsed = time.time() - motion_start_time
+            t = min(1.0, elapsed / duration)  # Normalized time [0, 1]
 
-            # Check if we've reached target
-            state = self._backend.get_state()
-            current_q = state.get("q", [0.0] * 7)
-            dq = state.get("dq", [0.0] * 7)
+            # Cubic ease-in-out interpolation
+            alpha = self._cubic_ease_in_out(t)
 
-            # Check position error and velocity
-            errors = [abs(current_q[i] - q[i]) for i in range(7)]
-            max_error = max(errors)
-            max_vel = max(abs(v) for v in dq)
+            # Interpolate joint positions
+            interp_q = [start_q[i] + alpha * (q[i] - start_q[i]) for i in range(7)]
 
-            # Done if close to target and not moving much
-            if max_error < 0.02 and max_vel < 0.05:  # ~1 degree error, low velocity
-                return
+            # Send interpolated command
+            self._backend.send_joint_position(interp_q, blocking=False)
+
+            # Check if motion complete
+            if t >= 1.0:
+                # Verify we've reached target
+                state = self._backend.get_state()
+                current_q = state.get("q", [0.0] * 7)
+                dq = state.get("dq", [0.0] * 7)
+
+                errors = [abs(current_q[i] - q[i]) for i in range(7)]
+                max_error = max(errors)
+                max_vel = max(abs(v) for v in dq)
+
+                # Done if close to target and not moving much
+                if max_error < 0.02 and max_vel < 0.05:
+                    return
 
             time.sleep(command_interval)
 
