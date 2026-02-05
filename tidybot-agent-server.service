@@ -1,0 +1,18 @@
+[Unit]
+Description=TidyBot Agent Server
+After=network.target
+
+[Service]
+Type=simple
+User=tidybot
+WorkingDirectory=/home/tidybot/tidybot_army/tidybot-agent-server
+Environment="PATH=/home/tidybot/tidybot_army/franka_interact/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/tidybot/.tidybot-env
+
+ExecStart=/home/tidybot/tidybot_army/franka_interact/.venv/bin/python3 server.py --auto-start-services
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

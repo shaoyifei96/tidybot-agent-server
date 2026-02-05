@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
+
+# Runtime files
+.agent_server_pids.json
+*.log
