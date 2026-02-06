@@ -11,7 +11,7 @@ from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-router = APIRouter(prefix="/cmd")
+router = APIRouter(prefix="/cmd", include_in_schema=False)
 
 
 # -- request models ----------------------------------------------------------

@@ -10,6 +10,7 @@ import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter
+from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
 
@@ -209,11 +210,11 @@ async def get_sdk_documentation():
     return generate_sdk_docs()
 
 
-@router.get("/sdk/markdown")
+@router.get("/sdk/markdown", response_class=HTMLResponse)
 async def get_sdk_markdown():
-    """Get SDK documentation as markdown.
+    """Get SDK documentation as rendered HTML.
 
-    Useful for displaying in documentation viewers or chat interfaces.
+    Opens nicely in a browser. Also usable by agents via curl.
 
     No lease required.
     """
@@ -280,4 +281,107 @@ async def get_sdk_markdown():
                     md += f"- `{method}`\n"
                 md += "\n"
 
-    return {"markdown": md}
+    # Render markdown to HTML using zero-dependency approach
+    import html as html_mod
+    raw_md = md
+
+    # Convert markdown to HTML (lightweight, no external deps)
+    lines = raw_md.split("\n")
+    html_lines = []
+    in_code_block = False
+    in_list = False
+
+    for line in lines:
+        if line.startswith("```"):
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            if in_code_block:
+                html_lines.append("</code></pre>")
+                in_code_block = False
+            else:
+                lang = line[3:].strip()
+                html_lines.append(f'<pre><code class="language-{lang}">')
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            html_lines.append(html_mod.escape(line))
+            continue
+
+        stripped = line.strip()
+
+        if not stripped:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append("")
+            continue
+
+        if stripped.startswith("- "):
+            if not in_list:
+                html_lines.append("<ul>")
+                in_list = True
+            content = stripped[2:]
+            # Inline code
+            import re
+            content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+            html_lines.append(f"<li>{content}</li>")
+            continue
+
+        if in_list:
+            html_lines.append("</ul>")
+            in_list = False
+
+        if stripped.startswith("#### "):
+            content = stripped[5:]
+            content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+            html_lines.append(f"<h4>{content}</h4>")
+        elif stripped.startswith("### "):
+            content = stripped[4:]
+            content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+            html_lines.append(f"<h3>{content}</h3>")
+        elif stripped.startswith("## "):
+            content = stripped[3:]
+            html_lines.append(f"<h2>{content}</h2>")
+        elif stripped.startswith("# "):
+            content = stripped[2:]
+            html_lines.append(f"<h1>{content}</h1>")
+        else:
+            import re
+            content = stripped
+            content = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', content)
+            content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+            html_lines.append(f"<p>{content}</p>")
+
+    if in_list:
+        html_lines.append("</ul>")
+    if in_code_block:
+        html_lines.append("</code></pre>")
+
+    body = "\n".join(html_lines)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot SDK Documentation</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; line-height: 1.6; color: #24292e; }}
+  h1 {{ border-bottom: 2px solid #e1e4e8; padding-bottom: 0.3em; }}
+  h2 {{ border-bottom: 1px solid #e1e4e8; padding-bottom: 0.3em; margin-top: 2em; }}
+  h3 {{ margin-top: 1.5em; }}
+  h4 {{ margin-top: 1em; color: #0366d6; }}
+  pre {{ background: #f6f8fa; border-radius: 6px; padding: 16px; overflow-x: auto; }}
+  code {{ font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.9em; }}
+  p > code, li > code, h3 > code, h4 > code {{ background: #f0f0f0; padding: 0.2em 0.4em; border-radius: 3px; }}
+  ul {{ padding-left: 1.5em; }}
+  li {{ margin: 0.25em 0; }}
+  strong {{ font-weight: 600; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
