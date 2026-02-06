@@ -86,11 +86,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .boundary-status { font-size: 12px; padding: 4px 8px; border-radius: 4px; }
   .boundary-status.safe { background: #1b5e20; color: #4caf50; }
   .boundary-status.warning { background: #e65100; color: #ff9800; }
+  /* Info Row: Rewind Logs | Base Trajectory | Lease Queue */
+  .info-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 1200px) { .info-row { grid-template-columns: 1fr; } }
   /* Trajectory Visualization */
-  .trajectory-section { margin-bottom: 24px; }
   .trajectory-card { background: #16213e; border-radius: 8px; padding: 16px; }
   .trajectory-card h3 { font-size: 14px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
-  .trajectory-canvas-container { position: relative; width: 100%; aspect-ratio: 1; max-width: 500px; margin: 0 auto; }
+  .trajectory-canvas-container { position: relative; width: 100%; aspect-ratio: 1; max-width: 267px; margin: 0 auto; }
   #trajectory-canvas { width: 100%; height: 100%; background: #0d1117; border-radius: 8px; border: 1px solid #30363d; }
   .trajectory-legend { display: flex; gap: 16px; margin-top: 12px; justify-content: center; flex-wrap: wrap; }
   .legend-item { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #888; }
@@ -102,36 +104,62 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .legend-line.boundary { background: #f44336; border: 1px dashed #f44336; }
   .trajectory-info { display: flex; gap: 24px; margin-top: 12px; justify-content: center; font-size: 12px; color: #888; }
   .trajectory-info span { font-family: 'SF Mono', Monaco, monospace; color: #4caf50; }
+  /* Lease Queue */
+  .lease-card { background: #16213e; border-radius: 8px; padding: 16px; }
+  .lease-card h3 { font-size: 14px; color: #aaa; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+  .lease-holder { font-family: 'SF Mono', Monaco, monospace; font-size: 14px; color: #4caf50; padding: 8px 0; }
+  .lease-holder.none { color: #666; font-style: italic; }
+  .lease-holder.resetting { color: #ff9800; }
+  .lease-queue-list { list-style: none; padding: 0; }
+  .lease-queue-list li { padding: 6px 0; border-bottom: 1px solid #1a1a2e; font-size: 13px; color: #888; display: flex; justify-content: space-between; }
+  .lease-queue-list li:last-child { border-bottom: none; }
+  .lease-queue-pos { color: #666; font-size: 11px; }
+  .lease-queue-name { font-family: 'SF Mono', Monaco, monospace; color: #c9d1d9; }
+  .activity-badge { font-size: 12px; padding: 4px 10px; border-radius: 4px; font-weight: 500; }
+  .activity-badge.idle { background: #1b5e20; color: #4caf50; }
+  .activity-badge.executing { background: #0d47a1; color: #42a5f5; animation: pulse 1.5s infinite; }
+  .activity-badge.rewinding { background: #e65100; color: #ff9800; animation: pulse 1s infinite; }
+  .activity-badge.resetting { background: #4a148c; color: #ce93d8; animation: pulse 1s infinite; }
+  .activity-badge.recovering { background: #b71c1c; color: #ef9a9a; animation: pulse 1s infinite; }
 </style></head><body>
 <h1>Service Dashboard<span id="dry-run-badge" class="dry-run-badge" style="display:none">DRY-RUN</span></h1>
 <p class="subtitle">TidyBot Agent Server — Backend Service Manager</p>
 
+<!-- Row 1: Current State -->
+<div class="state-section">
+  <div class="state-grid">
+    <div class="state-card">
+      <h3>Base Odometry</h3>
+      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="base-x">—</span></div>
+      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="base-y">—</span></div>
+      <div class="state-row"><span class="state-label">Theta</span><span class="state-value" id="base-theta">—</span></div>
+    </div>
+    <div class="state-card">
+      <h3>Arm EE (Base Frame)</h3>
+      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="ee-x">—</span></div>
+      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="ee-y">—</span></div>
+      <div class="state-row"><span class="state-label">Z</span><span class="state-value" id="ee-z">—</span></div>
+    </div>
+    <div class="state-card">
+      <h3>Arm EE (World Frame)</h3>
+      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="ee-world-x">—</span></div>
+      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="ee-world-y">—</span></div>
+      <div class="state-row"><span class="state-label">Z</span><span class="state-value" id="ee-world-z">—</span></div>
+    </div>
+    <div class="state-card">
+      <h3>Gripper</h3>
+      <div class="state-row"><span class="state-label">Width</span><span class="state-value" id="gripper-width">—</span></div>
+      <div class="state-row"><span class="state-label">Grasped</span><span class="state-value" id="gripper-grasped">—</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- Row 2: Rewind Logs | Manual Rewind | Reset to Home -->
 <div class="control-section">
   <div class="control-grid">
     <div class="control-card">
-      <h3>Safety Monitor <span id="auto-rewind-badge" class="status-badge disabled">Disabled</span></h3>
-      <div class="control-row">
-        <span class="control-label">Auto-Rewind</span>
-        <label class="toggle-switch">
-          <input type="checkbox" id="auto-rewind-toggle" onchange="toggleAutoRewind(this.checked)">
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-      <div class="control-row">
-        <span class="control-label">Auto-Rewind %</span>
-        <input type="number" id="auto-rewind-pct" class="control-input" min="0.1" max="100" step="0.1" value="10" onchange="updateAutoRewindPct(this.value)">
-      </div>
-      <div class="control-row">
-        <span class="control-label">Boundary Status</span>
-        <span id="boundary-status" class="boundary-status safe">Safe</span>
-      </div>
-      <div class="control-row">
-        <span class="control-label">Trajectory Length</span>
-        <span class="state-value" id="trajectory-length">0</span>
-      </div>
-      <button class="btn-action" style="background: #666; margin-top: 8px;" onclick="clearTrajectory(this)">
-        Clear Trajectory
-      </button>
+      <h3>Rewind Logs</h3>
+      <div id="rewind-logs" class="log-box" style="height: 125px; font-size: 11px;"></div>
     </div>
     <div class="control-card">
       <h3>Manual Rewind</h3>
@@ -164,67 +192,113 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<div class="logs-section">
+<!-- Row 3: Safety Monitor | Base Trajectory | Lease Queue -->
+<div class="info-row">
   <div class="control-card">
-    <h3>Rewind Logs</h3>
-    <div id="rewind-logs" class="log-box" style="height: 200px; font-size: 11px;"></div>
+    <h3>Safety Monitor <span id="auto-rewind-badge" class="status-badge disabled">Disabled</span></h3>
+    <div class="control-row">
+      <span class="control-label">Auto-Rewind</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="auto-rewind-toggle" onchange="toggleAutoRewind(this.checked)">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+    <div class="control-row">
+      <span class="control-label">Auto-Rewind %</span>
+      <input type="number" id="auto-rewind-pct" class="control-input" min="0.1" max="100" step="0.1" value="10" onchange="updateAutoRewindPct(this.value)">
+    </div>
+    <div class="control-row">
+      <span class="control-label">Boundary Status</span>
+      <span id="boundary-status" class="boundary-status safe">Safe</span>
+    </div>
+    <div class="control-row">
+      <span class="control-label">Collision Status</span>
+      <span id="collision-status" class="boundary-status safe">None</span>
+    </div>
+    <div class="control-row">
+      <span class="control-label">Base Velocity</span>
+      <span class="state-value" id="base-velocity">0.000 m/s</span>
+    </div>
+    <div class="control-row">
+      <span class="control-label">Trajectory Length</span>
+      <span class="state-value" id="trajectory-length">0</span>
+    </div>
+    <button class="btn-action" style="background: #666; margin-top: 8px;" onclick="clearTrajectory(this)">
+      Clear Trajectory
+    </button>
   </div>
-</div>
 
-<div class="trajectory-section">
   <div class="trajectory-card">
     <h3>Base Trajectory</h3>
     <div class="trajectory-canvas-container">
       <canvas id="trajectory-canvas"></canvas>
     </div>
     <div class="trajectory-legend">
-      <div class="legend-item"><div class="legend-dot current"></div>Current Position</div>
-      <div class="legend-item"><div class="legend-dot path"></div>Trajectory Path</div>
-      <div class="legend-item"><div class="legend-dot start"></div>Start Position</div>
-      <div class="legend-item"><div class="legend-line boundary"></div>Workspace Boundary</div>
+      <div class="legend-item"><div class="legend-dot current"></div>Current</div>
+      <div class="legend-item"><div class="legend-dot path"></div>Path</div>
+      <div class="legend-item"><div class="legend-dot start"></div>Start</div>
+      <div class="legend-item"><div class="legend-line boundary"></div>Boundary</div>
     </div>
     <div class="trajectory-info">
-      <div>Points: <span id="traj-points">0</span></div>
-      <div>Duration: <span id="traj-duration">0.0s</span></div>
+      <div>Pts: <span id="traj-points">0</span></div>
+      <div>Dur: <span id="traj-duration">0.0s</span></div>
       <div>X: <span id="traj-x">—</span></div>
       <div>Y: <span id="traj-y">—</span></div>
     </div>
   </div>
-</div>
 
-<div class="state-section">
-  <div class="state-grid">
-    <div class="state-card">
-      <h3>Base Odometry</h3>
-      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="base-x">—</span></div>
-      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="base-y">—</span></div>
-      <div class="state-row"><span class="state-label">Theta</span><span class="state-value" id="base-theta">—</span></div>
+  <div class="lease-card">
+    <h3>Lease Queue</h3>
+    <div class="control-row">
+      <span class="control-label">Current Holder</span>
+      <span id="lease-holder" class="lease-holder none">(none)</span>
     </div>
-    <div class="state-card">
-      <h3>Arm EE (Base Frame)</h3>
-      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="ee-x">—</span></div>
-      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="ee-y">—</span></div>
-      <div class="state-row"><span class="state-label">Z</span><span class="state-value" id="ee-z">—</span></div>
+    <div class="control-row">
+      <span class="control-label">Remaining</span>
+      <span class="state-value" id="lease-remaining">—</span>
     </div>
-    <div class="state-card">
-      <h3>Arm EE (World Frame)</h3>
-      <div class="state-row"><span class="state-label">X</span><span class="state-value" id="ee-world-x">—</span></div>
-      <div class="state-row"><span class="state-label">Y</span><span class="state-value" id="ee-world-y">—</span></div>
-      <div class="state-row"><span class="state-label">Z</span><span class="state-value" id="ee-world-z">—</span></div>
+    <div class="control-row">
+      <span class="control-label">Status</span>
+      <span id="lease-status-badge" class="boundary-status safe">Free</span>
     </div>
-    <div class="state-card">
-      <h3>Gripper</h3>
-      <div class="state-row"><span class="state-label">Width</span><span class="state-value" id="gripper-width">—</span></div>
-      <div class="state-row"><span class="state-label">Grasped</span><span class="state-value" id="gripper-grasped">—</span></div>
+    <div class="control-row">
+      <span class="control-label">Activity</span>
+      <span id="robot-activity" class="activity-badge idle">Idle</span>
+    </div>
+    <div style="margin-top: 12px;">
+      <div class="control-label" style="margin-bottom: 6px;">Queue (<span id="lease-queue-len">0</span> waiting)</div>
+      <ul class="lease-queue-list" id="lease-queue-list">
+        <li style="color: #666; font-style: italic;">Empty</li>
+      </ul>
     </div>
   </div>
 </div>
 
+<!-- Row 4: Code Execution History (full width) -->
+<div style="margin-bottom: 24px;">
+  <div class="control-card">
+    <h3>Code Execution History</h3>
+    <div id="code-history" style="display: flex; flex-direction: column; gap: 6px;"></div>
+  </div>
+</div>
+
+<!-- Row 5: Logs (2 columns) -->
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px;">
+  <div class="control-card">
+    <h3>Server Logs</h3>
+    <div id="server-logs" class="log-box" style="height: 300px; font-size: 11px;"></div>
+  </div>
+  <div class="control-card">
+    <h3>Service Logs</h3>
+    <div id="service-logs-combined" class="log-box" style="height: 300px; font-size: 11px;"></div>
+  </div>
+</div>
+
+<!-- Row 5: Services (start and forget) -->
 <table>
   <thead><tr><th>Service</th><th>Status</th><th>PID</th><th>Uptime</th><th>Actions</th></tr></thead>
   <tbody id="tbl"><tr><td colspan="5" style="text-align:center;color:#666">Loading...</td></tr></tbody>
 </table>
-<div class="logs-section" id="logs-section"></div>
 <p class="refresh-info">Auto-refreshes every 2 seconds</p>
 <script>
 let serviceManagerEnabled = true;  // Replaced by server when disabled
@@ -251,11 +325,9 @@ async function act(method, url, btn) {
 async function poll() {
   // Skip service polling if service manager is disabled
   if (!serviceManagerEnabled) {
-    // Hide service-related sections
+    // Hide service table when service manager is disabled
     const tbl = document.querySelector("table");
     if (tbl) tbl.style.display = "none";
-    const logsSection = document.getElementById("logs-section");
-    if (logsSection) logsSection.style.display = "none";
     // Update subtitle
     const subtitle = document.querySelector(".subtitle");
     if (subtitle) subtitle.textContent = "TidyBot Agent Server — Service Manager Disabled";
@@ -297,41 +369,10 @@ async function poll() {
     document.getElementById("tbl").innerHTML = rows;
     document.getElementById("dry-run-badge").style.display = isDryRun ? "inline" : "none";
 
-    // Update log sections if keys changed
-    if (JSON.stringify(newKeys) !== JSON.stringify(serviceKeys)) {
-      serviceKeys = newKeys;
-      let logsHtml = "";
-      for (const s of data) {
-        logsHtml += `<div class="log-title">${s.name}</div><div class="log-box" id="log-${s.key}">(no output)</div>`;
-      }
-      document.getElementById("logs-section").innerHTML = logsHtml;
-    }
+    serviceKeys = newKeys;
 
-    // Fetch logs for each service
-    for (const s of data) {
-      const logsResp = await fetch(`/services/${s.key}/logs?lines=50`);
-      const logsData = await logsResp.json();
-      const el = document.getElementById("log-" + s.key);
-      if (el && logsData.lines) {
-        // Color code log lines based on error patterns
-        const coloredLines = logsData.lines.map(line => {
-          const escaped = line.replace(/</g, "&lt;");
-          // Check for error patterns (case-insensitive)
-          const lower = line.toLowerCase();
-          if (lower.includes("error") || lower.includes("exception") || lower.includes("critical") ||
-              lower.includes("failed") || lower.includes("traceback") || lower.includes("fatal")) {
-            return `<span style="color: #f85149;">${escaped}</span>`;  // Red for errors
-          } else if (lower.includes("warning") || lower.includes("warn")) {
-            return `<span style="color: #d29922;">${escaped}</span>`;  // Orange for warnings
-          }
-          return escaped;
-        });
-        const content = coloredLines.join("\n") || "(no output)";
-        const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
-        el.innerHTML = content;
-        if (wasAtBottom) el.scrollTop = el.scrollHeight;
-      }
-    }
+    // Combined service logs
+    await pollServiceLogs(data);
   } catch (e) {
     console.error("Poll error:", e);
   }
@@ -348,6 +389,11 @@ async function pollState() {
     document.getElementById("base-x").textContent = pose[0].toFixed(3) + " m";
     document.getElementById("base-y").textContent = pose[1].toFixed(3) + " m";
     document.getElementById("base-theta").textContent = (pose[2] * 180 / Math.PI).toFixed(1) + "°";
+
+    // Base velocity
+    const vel = base.velocity || [0, 0, 0];
+    const speed = Math.sqrt(vel[0] * vel[0] + vel[1] * vel[1]);
+    document.getElementById("base-velocity").textContent = speed.toFixed(3) + " m/s";
 
     // Arm EE pose (4x4 matrix stored column-major, position is indices 12,13,14)
     const arm = state.arm || {};
@@ -396,62 +442,32 @@ async function pollState() {
   }
 }
 
-// Lease ID for commands (acquire one automatically)
-let leaseId = null;
-let leaseHeartbeatInterval = null;
-
-async function ensureLease() {
-  if (leaseId) {
-    // Verify cached lease is still valid
-    try {
-      const statusResp = await fetch("/lease/status");
-      const status = await statusResp.json();
-      if (status.holder !== "dashboard") {
-        leaseId = null; // Lease was revoked, clear cache
-      }
-    } catch (e) {
-      leaseId = null;
-    }
-  }
-
-  if (leaseId) return leaseId;
-
+// Acquire a lease, use it, then release it when done
+async function acquireLease() {
   try {
     const resp = await fetch("/lease/acquire", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ holder: "dashboard", timeout_sec: 300 })
+      body: JSON.stringify({ holder: "dashboard" })
     });
     const data = await resp.json();
-    if (data.lease_id) {
-      leaseId = data.lease_id;
-      // Clear any existing heartbeat interval
-      if (leaseHeartbeatInterval) {
-        clearInterval(leaseHeartbeatInterval);
-      }
-      // Heartbeat to keep lease alive (extend every 10 seconds)
-      leaseHeartbeatInterval = setInterval(async () => {
-        if (leaseId) {
-          try {
-            const extResp = await fetch("/lease/extend", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ lease_id: leaseId })
-            });
-            const extData = await extResp.json();
-            if (extData.status === "not_found") {
-              leaseId = null; // Lease expired, clear cache
-            }
-          } catch (e) {
-            leaseId = null; // Connection error, clear cache
-          }
-        }
-      }, 10000);
-    }
-    return leaseId;
+    return data.lease_id || null;
   } catch (e) {
     console.error("Failed to acquire lease:", e);
     return null;
+  }
+}
+
+async function releaseLease(id) {
+  if (!id) return;
+  try {
+    await fetch("/lease/release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lease_id: id })
+    });
+  } catch (e) {
+    console.error("Failed to release lease:", e);
   }
 }
 
@@ -512,8 +528,9 @@ async function clearTrajectory(btn) {
 
 async function triggerManualRewind(btn) {
   btn.disabled = true;
+  let lease = null;
   try {
-    const lease = await ensureLease();
+    lease = await acquireLease();
     if (!lease) {
       alert("Failed to acquire lease for rewind");
       return;
@@ -527,7 +544,7 @@ async function triggerManualRewind(btn) {
       body: JSON.stringify({ dry_run: false })
     });
     if (resp.status === 403) {
-      leaseId = null; // Clear invalid lease
+      lease = null;
       alert("Lease expired. Please try again.");
       return;
     }
@@ -540,14 +557,16 @@ async function triggerManualRewind(btn) {
     console.error("Failed to trigger manual rewind:", e);
     alert("Error: " + e.message);
   } finally {
+    await releaseLease(lease);
     btn.disabled = false;
   }
 }
 
 async function resetToHome(btn) {
   btn.disabled = true;
+  let lease = null;
   try {
-    const lease = await ensureLease();
+    lease = await acquireLease();
     if (!lease) {
       alert("Failed to acquire lease");
       return;
@@ -561,7 +580,7 @@ async function resetToHome(btn) {
       body: JSON.stringify({ dry_run: false })
     });
     if (resp.status === 403) {
-      leaseId = null; // Clear invalid lease
+      lease = null;
       alert("Lease expired. Please try again.");
       return;
     }
@@ -574,6 +593,7 @@ async function resetToHome(btn) {
     console.error("Failed to reset to home:", e);
     alert("Error: " + e.message);
   } finally {
+    await releaseLease(lease);
     btn.disabled = false;
   }
 }
@@ -611,6 +631,16 @@ async function pollRewind() {
     } else {
       boundaryEl.textContent = "Safe";
       boundaryEl.className = "boundary-status safe";
+    }
+
+    // Update collision status
+    const collisionEl = document.getElementById("collision-status");
+    if (status.collision_detected) {
+      collisionEl.textContent = "COLLISION";
+      collisionEl.className = "boundary-status warning";
+    } else {
+      collisionEl.textContent = "None";
+      collisionEl.className = "boundary-status safe";
     }
 
     // Get monitor status
@@ -817,12 +847,12 @@ async function pollTrajectory() {
     const status = await statusResp.json();
     const boundary = status.base_boundary_status || {};
 
-    if (boundary.x_min !== undefined) {
+    if (boundary.bounds) {
       workspaceBounds = {
-        x_min: boundary.x_min,
-        x_max: boundary.x_max,
-        y_min: boundary.y_min,
-        y_max: boundary.y_max
+        x_min: boundary.bounds.x_min,
+        x_max: boundary.bounds.x_max,
+        y_min: boundary.bounds.y_min,
+        y_max: boundary.bounds.y_max
       };
     }
 
@@ -856,6 +886,173 @@ async function pollTrajectory() {
 // Initialize canvas on load
 window.addEventListener("load", initTrajectoryCanvas);
 window.addEventListener("resize", initTrajectoryCanvas);
+
+// Code execution history polling
+async function pollCodeLogs() {
+  try {
+    const el = document.getElementById("code-history");
+    if (!el) return;
+
+    const [statusResp, histResp] = await Promise.all([
+      fetch("/code/status"),
+      fetch("/code/history?count=3")
+    ]);
+    const status = await statusResp.json();
+    const histData = await histResp.json();
+    const history = histData.history || [];
+
+    if (history.length === 0 && !status.is_running) {
+      el.innerHTML = '<span style="color: #666; font-size: 12px;">No code executed yet...</span>';
+      return;
+    }
+
+    let html = "";
+
+    // Show running indicator at top if active
+    if (status.is_running) {
+      html += `<div style="background: #1a2332; border: 1px solid #42a5f5; border-radius: 6px; padding: 6px 10px; font-size: 11px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="color: #42a5f5; font-weight: 600;">Running</span>
+          <span style="color: #666; font-size: 10px;">${status.execution_id || "..."}</span>
+        </div>
+      </div>`;
+    }
+
+    // Show last 3 results as rows
+    for (const r of history) {
+      const ok = r.status === "completed";
+      const borderColor = ok ? "#2d5a2d" : r.status === "failed" ? "#5a2d2d" : "#5a4a2d";
+      const statusColor = ok ? "#4caf50" : r.status === "failed" ? "#f85149" : "#d29922";
+      const statusIcon = ok ? "OK" : r.status === "failed" ? "FAIL" : r.status.toUpperCase();
+      const holder = r.holder || "unknown";
+      const clientHost = r.client_host || "";
+      const dur = r.duration?.toFixed(1) || "0";
+
+      // Get last few meaningful stdout lines (skip SDK init lines)
+      let outputLines = [];
+      if (r.stdout) {
+        outputLines = r.stdout.trim().split("\\n").filter(l => !l.startsWith("[SDK]") && l.trim());
+        outputLines = outputLines.slice(-4);  // last 4 lines
+      }
+      let errLines = [];
+      if (!ok && r.stderr) {
+        errLines = r.stderr.trim().split("\\n").filter(l => l.trim()).slice(-2);
+      }
+
+      html += `<div style="background: #161b22; border: 1px solid ${borderColor}; border-radius: 6px; padding: 10px 14px; font-size: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="color: ${statusColor}; font-weight: 700; font-size: 13px;">${statusIcon}</span>
+            <span style="color: #e6edf3; font-weight: 600; font-size: 13px;">${holder.replace(/</g, "&lt;")}</span>
+            ${clientHost ? `<span style="color: #555; font-size: 11px;">${clientHost}</span>` : ""}
+          </div>
+          <div style="color: #666; font-size: 11px;">${dur}s &middot; ${r.execution_id || ""}</div>
+        </div>
+        <div style="font-family: monospace; font-size: 11px; line-height: 1.5;">`;
+
+      // Show output lines
+      if (errLines.length > 0) {
+        for (const line of errLines) {
+          html += `<div style="color: #f85149; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
+        }
+      }
+      if (outputLines.length > 0) {
+        for (const line of outputLines) {
+          html += `<div style="color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
+        }
+      }
+
+      html += `</div></div>`;
+    }
+
+    el.innerHTML = html;
+  } catch (e) {
+    console.error("Code history poll error:", e);
+  }
+}
+
+// Combined service logs polling
+async function pollServiceLogs(servicesData) {
+  try {
+    const el = document.getElementById("service-logs-combined");
+    if (!el) return;
+
+    // If no data passed, fetch from services (or skip if disabled)
+    let data = servicesData;
+    if (!data && serviceManagerEnabled) {
+      const resp = await fetch("/services");
+      data = await resp.json();
+    }
+    if (!data || !data.length) {
+      el.innerHTML = '<span style="color: #666;">No services...</span>';
+      return;
+    }
+
+    let allLines = [];
+    for (const s of data) {
+      try {
+        const logsResp = await fetch(`/services/${s.key}/logs?lines=20`);
+        const logsData = await logsResp.json();
+        if (logsData.lines) {
+          for (const line of logsData.lines.slice(-10)) {
+            const escaped = line.replace(/</g, "&lt;");
+            const lower = line.toLowerCase();
+            let color = "#8b949e";
+            if (lower.includes("error") || lower.includes("exception") || lower.includes("critical") ||
+                lower.includes("failed") || lower.includes("traceback")) {
+              color = "#f85149";
+            } else if (lower.includes("warning") || lower.includes("warn")) {
+              color = "#d29922";
+            }
+            allLines.push(`<div style="color: ${color};"><span style="color: #666;">[${s.key}]</span> ${escaped}</div>`);
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (allLines.length === 0) {
+      el.innerHTML = '<span style="color: #666;">No service logs...</span>';
+    } else {
+      const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
+      el.innerHTML = allLines.join("");
+      if (wasAtBottom) el.scrollTop = el.scrollHeight;
+    }
+  } catch (e) {
+    console.error("Service logs poll error:", e);
+  }
+}
+
+// Server logs polling
+async function pollServerLogs() {
+  try {
+    const resp = await fetch("/logs?limit=100");
+    const data = await resp.json();
+    const logsEl = document.getElementById("server-logs");
+    if (!logsEl) return;
+
+    const logs = data.logs || [];
+    if (logs.length === 0) {
+      logsEl.innerHTML = '<span style="color: #666;">No logs yet...</span>';
+      return;
+    }
+
+    const html = logs.map(log => {
+      const time = log.timestamp.split("T")[1].split(".")[0];
+      let color = "#8b949e";
+      if (log.level === "ERROR" || log.level === "CRITICAL") {
+        color = "#f85149";
+      } else if (log.level === "WARNING") {
+        color = "#d29922";
+      }
+      return `<div style="color: ${color};">[${time}] ${log.name}: ${log.message}</div>`;
+    }).join("");
+
+    logsEl.innerHTML = html;
+    logsEl.scrollTop = logsEl.scrollHeight;
+  } catch (e) {
+    console.error("Server logs poll error:", e);
+  }
+}
 
 // Rewind logs polling
 async function pollRewindLogs() {
@@ -893,16 +1090,104 @@ async function pollRewindLogs() {
   }
 }
 
+async function pollLease() {
+  try {
+    const [leaseResp, rewindResp, codeResp] = await Promise.all([
+      fetch("/lease/status"),
+      fetch("/rewind/status"),
+      fetch("/code/status")
+    ]);
+    const data = await leaseResp.json();
+    const rewindData = await rewindResp.json();
+    const codeData = await codeResp.json();
+
+    // Current holder
+    const holderEl = document.getElementById("lease-holder");
+    if (data.resetting) {
+      holderEl.textContent = "Resetting...";
+      holderEl.className = "lease-holder resetting";
+    } else if (data.holder) {
+      holderEl.textContent = data.holder;
+      holderEl.className = "lease-holder";
+    } else {
+      holderEl.textContent = "(none)";
+      holderEl.className = "lease-holder none";
+    }
+
+    // Remaining time
+    const remEl = document.getElementById("lease-remaining");
+    if (data.holder && data.remaining_s != null) {
+      const m = Math.floor(data.remaining_s / 60);
+      const s = Math.floor(data.remaining_s % 60);
+      remEl.textContent = m > 0 ? m + "m " + s + "s" : s + "s";
+    } else {
+      remEl.textContent = "—";
+    }
+
+    // Status badge
+    const badgeEl = document.getElementById("lease-status-badge");
+    if (data.resetting) {
+      badgeEl.textContent = "Resetting";
+      badgeEl.className = "boundary-status warning";
+    } else if (data.holder) {
+      badgeEl.textContent = "Held";
+      badgeEl.className = "boundary-status warning";
+    } else {
+      badgeEl.textContent = "Free";
+      badgeEl.className = "boundary-status safe";
+    }
+
+    // Activity state: recovering arm > rewinding > resetting > executing code > idle
+    const actEl = document.getElementById("robot-activity");
+    if (rewindData.arm_recovering) {
+      actEl.textContent = "Recovering Arm";
+      actEl.className = "activity-badge recovering";
+    } else if (rewindData.is_rewinding) {
+      actEl.textContent = "Rewinding";
+      actEl.className = "activity-badge rewinding";
+    } else if (data.resetting) {
+      actEl.textContent = "Resetting";
+      actEl.className = "activity-badge resetting";
+    } else if (codeData.is_running) {
+      actEl.textContent = "Executing Code";
+      actEl.className = "activity-badge executing";
+    } else {
+      actEl.textContent = "Idle";
+      actEl.className = "activity-badge idle";
+    }
+
+    // Queue
+    const queueLen = data.queue_length || 0;
+    document.getElementById("lease-queue-len").textContent = queueLen;
+    const listEl = document.getElementById("lease-queue-list");
+    if (queueLen === 0) {
+      listEl.innerHTML = '<li style="color: #666; font-style: italic;">Empty</li>';
+    } else {
+      listEl.innerHTML = data.queue.map(e =>
+        `<li><span class="lease-queue-pos">#${e.position}</span><span class="lease-queue-name">${e.holder}</span></li>`
+      ).join("");
+    }
+  } catch (e) {
+    console.error("Lease poll error:", e);
+  }
+}
+
 poll();
 pollState();
 pollRewind();
 pollTrajectory();
 pollRewindLogs();
+pollServerLogs();
+pollCodeLogs();
+pollLease();
 setInterval(poll, 2000);
 setInterval(pollState, 200);
 setInterval(pollRewind, 500);
 setInterval(pollTrajectory, 500);
 setInterval(pollRewindLogs, 1000);
+setInterval(pollServerLogs, 2000);
+setInterval(pollCodeLogs, 2000);
+setInterval(pollLease, 1000);
 </script></body></html>"""
 
 

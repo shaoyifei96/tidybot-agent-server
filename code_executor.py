@@ -38,6 +38,8 @@ class ExecutionResult:
     stderr: str
     duration: float
     error: str = ""
+    holder: str = ""
+    client_host: str = ""
 
 
 @dataclass
@@ -267,6 +269,7 @@ class CodeExecutor:
         self._execution_id: Optional[str] = None
         self._start_time: Optional[float] = None
         self._last_result: Optional[ExecutionResult] = None
+        self._history: List[ExecutionResult] = []  # Last N results
         self._temp_files: list[Path] = []
 
     @property
@@ -306,6 +309,8 @@ class CodeExecutor:
         timeout: float = 300.0,
         lease_id: Optional[str] = None,
         server_url: str = "http://localhost:8080",
+        holder: str = "",
+        client_host: str = "",
     ) -> ExecutionResult:
         """Execute code in subprocess.
 
@@ -315,6 +320,7 @@ class CodeExecutor:
             timeout: Maximum execution time in seconds
             lease_id: Lease ID for rewind authorization (optional)
             server_url: Agent server URL for rewind API (default: http://localhost:8080)
+            holder: Lease holder name for history tracking
 
         Returns:
             ExecutionResult with status, stdout, stderr, etc.
@@ -329,6 +335,8 @@ class CodeExecutor:
         self._start_time = time.time()
         self._lease_id = lease_id
         self._server_url = server_url
+        self._holder = holder
+        self._client_host = client_host
 
         # Create temporary Python file with submitted code
         temp_file = self._create_temp_file(code)
@@ -406,7 +414,12 @@ class CodeExecutor:
 
         finally:
             self._process = None
+            result.holder = self._holder
+            result.client_host = self._client_host
             self._last_result = result
+            self._history.append(result)
+            if len(self._history) > 10:
+                self._history = self._history[-10:]
 
         logger.info(
             f"Execution {execution_id} finished: {result.status} "
@@ -464,6 +477,10 @@ class CodeExecutor:
     def get_last_result(self) -> Optional[ExecutionResult]:
         """Get result from last execution."""
         return self._last_result
+
+    def get_history(self, count: int = 3) -> List[ExecutionResult]:
+        """Get last N execution results (newest first)."""
+        return list(reversed(self._history[-count:]))
 
     def cleanup_temp_files(self) -> None:
         """Remove temporary code files."""

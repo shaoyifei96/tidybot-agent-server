@@ -125,7 +125,12 @@ def init_code_routes(lease_manager: LeaseManager):
         # Use timeout from request or default to 300s (5 minutes)
         timeout = body.timeout if body.timeout is not None else 300.0
 
-        logger.info(f"Executing code (ID: {execution_id}) for lease {x_lease_id}")
+        # Get holder name from lease and client IP
+        lease_info = lease_manager.current_lease
+        holder = lease_info.holder if lease_info else ""
+        client_host = request.client.host if request.client else ""
+
+        logger.info(f"Executing code (ID: {execution_id}) for lease {x_lease_id} holder={holder} from={client_host}")
 
         # Execute code in background task (non-blocking)
         import asyncio
@@ -137,6 +142,8 @@ def init_code_routes(lease_manager: LeaseManager):
                     execution_id=execution_id,
                     timeout=timeout,
                     lease_id=x_lease_id,  # Pass lease for rewind API
+                    holder=holder,
+                    client_host=client_host,
                 )
                 logger.info(f"Code execution {execution_id} finished: {result.status}")
             except Exception as e:
@@ -249,5 +256,15 @@ def init_code_routes(lease_manager: LeaseManager):
             result=result,
             error="",
         )
+
+    @router.get("/history")
+    async def get_history(count: int = 3):
+        """Get last N execution results (newest first).
+
+        No lease required (read-only).
+        """
+        executor = get_executor()
+        history = executor.get_history(count)
+        return {"history": history}
 
     return router
