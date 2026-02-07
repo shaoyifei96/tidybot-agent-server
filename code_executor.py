@@ -355,15 +355,19 @@ class CodeExecutor:
                 env=self._get_env(),
             )
 
+            # Save local reference: stop() may set self._process = None
+            # while we're awaiting, so we need a stable reference.
+            process = self._process
+
             # Wait for completion or timeout
             # Use asyncio.to_thread to avoid blocking the event loop
             # This allows the server to handle other requests (like rewind API calls
             # from the subprocess) while waiting for the code to complete
             try:
                 stdout, stderr = await asyncio.to_thread(
-                    self._process.communicate, timeout=timeout
+                    process.communicate, timeout=timeout
                 )
-                exit_code = self._process.returncode
+                exit_code = process.returncode
                 duration = time.time() - self._start_time
 
                 if exit_code == 0:
@@ -385,8 +389,8 @@ class CodeExecutor:
 
             except subprocess.TimeoutExpired:
                 # Kill process on timeout
-                self._process.kill()
-                stdout, stderr = await asyncio.to_thread(self._process.communicate)
+                process.kill()
+                stdout, stderr = await asyncio.to_thread(process.communicate)
                 duration = time.time() - self._start_time
 
                 result = ExecutionResult(
@@ -414,9 +418,16 @@ class CodeExecutor:
 
         finally:
             self._process = None
-            result.holder = self._holder
-            result.client_host = self._client_host
-            self._last_result = result
+            # If stop() already recorded a STOPPED result for this execution,
+            # keep that result instead of overwriting with a misleading status.
+            if (self._last_result
+                    and self._last_result.execution_id == execution_id
+                    and self._last_result.status == ExecutionStatus.STOPPED):
+                result = self._last_result
+            else:
+                result.holder = self._holder
+                result.client_host = self._client_host
+                self._last_result = result
             self._history.append(result)
             if len(self._history) > 10:
                 self._history = self._history[-10:]

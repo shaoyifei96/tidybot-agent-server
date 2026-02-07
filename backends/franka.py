@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,9 @@ class FrankaBackend:
         self._cfg = config
         self._dry_run = dry_run
         self._client: Any = None
+        # Staleness tracking — detect when franka_server stops publishing
+        self._last_state_q: list | None = None  # last observed q values
+        self._last_state_change_time: float = 0.0  # wall-clock time q last changed
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -67,8 +71,15 @@ class FrankaBackend:
 
     # -- state ---------------------------------------------------------------
 
+    # If state_count hasn't changed for this long, state is stale
+    STATE_STALE_TIMEOUT = 2.0
+
     def get_state(self) -> dict:
-        """Return arm state as a plain dict."""
+        """Return arm state as a plain dict.
+
+        Returns empty dict if the ZMQ subscriber has stopped receiving
+        updates (franka_server likely crashed).
+        """
         if self._dry_run:
             return {
                 "q": [0.0] * 7,
@@ -77,11 +88,31 @@ class FrankaBackend:
                 "ee_wrench": [0.0] * 6,
                 "control_mode": 0,
             }
+        if self._client is None:
+            return {}
         state = self._client.latest_state
         if state is None:
             return {}
+
+        q = list(state.q)
+        now = time.time()
+
+        # Detect staleness: check if the ZMQ state_count is still advancing.
+        # The client increments _state_count on every received message.
+        # If the count hasn't changed, the subscriber isn't getting updates.
+        current_count = getattr(self._client, '_state_count', None)
+        if current_count is not None:
+            last_count = getattr(self, '_last_state_count', None)
+            if last_count is None or current_count != last_count:
+                # New messages are arriving
+                self._last_state_count = current_count
+                self._last_state_change_time = now
+            elif now - self._last_state_change_time > self.STATE_STALE_TIMEOUT:
+                # No new ZMQ messages for STATE_STALE_TIMEOUT seconds
+                return {}
+
         return {
-            "q": list(state.q),
+            "q": q,
             "dq": list(state.dq),
             "ee_pose": list(state.O_T_EE),
             "ee_wrench": list(state.O_F_ext_hat_K),
@@ -95,10 +126,15 @@ class FrankaBackend:
             return True
         return self._client.send_joint_position(np.array(q), blocking=blocking)
 
-    def send_cartesian_pose(self, pose: list[float]) -> bool:
+    def send_cartesian_pose(self, pose: list[float], blocking: bool = True) -> bool:
         if self._dry_run:
             return True
-        return self._client.send_cartesian_pose(np.array(pose), blocking=True)
+        return self._client.send_cartesian_pose(np.array(pose), blocking=blocking)
+
+    def set_gains(self, **kwargs) -> bool:
+        if self._dry_run:
+            return True
+        return self._client.set_gains(**kwargs)
 
     def send_joint_velocity(self, dq: list[float]) -> bool:
         if self._dry_run:

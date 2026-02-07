@@ -2,7 +2,7 @@
 """Test lease queue by submitting 3 jobs with different holders.
 
 Each job acquires its own lease (queues if busy), runs code, then releases.
-Each job: move +x 0.5m, move -y 0.5m, rotate 40 deg clockwise.
+Each job: rotate 45 deg left, then 45 deg right (back to start).
 """
 
 import json
@@ -46,14 +46,14 @@ print(f"=== Job {{JOB}} starting ===")
 pose = sensors.get_base_pose()
 print(f"Start: x={{pose[0]:.3f}}, y={{pose[1]:.3f}}, theta={{pose[2]:.3f}}")
 
-print("Moving +x 0.5m...")
-base.move_delta(dx=0.5, frame="local")
+print("Moving +x 0.2m...")
+base.move_delta(dx=0.2, frame="local")
 
-print("Moving -y 0.5m...")
-base.move_delta(dy=-0.5, frame="local")
+print("Moving -y 0.2m...")
+base.move_delta(dy=-0.2, frame="local")
 
 print("Rotating 40 deg CW...")
-base.rotate_degrees(-40)
+base.rotate_degrees(-20)
 
 pose = sensors.get_base_pose()
 print(f"End:   x={{pose[0]:.3f}}, y={{pose[1]:.3f}}, theta={{pose[2]:.3f}}")
@@ -123,7 +123,7 @@ def run_job(job_name: str, results: dict):
 
 def main():
     print("=" * 60)
-    print("  Queue Test: 3 Jobs (+x 0.5m, -y 0.5m, rotate -40 deg)")
+    print("  Queue Test: 3 Jobs (rotate 45° left, then 45° right)")
     print("  Each job acquires its own lease and queues if busy")
     print("=" * 60)
     print()

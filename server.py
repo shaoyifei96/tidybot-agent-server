@@ -7,12 +7,13 @@ import logging
 import os
 import sys
 
-# Add system_logger to path (sibling package)
+# Add project root and system_logger to path
 _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SERVER_DIR)
 _SYSTEM_LOGGER_DIR = os.path.join(_PROJECT_ROOT, "system_logger")
-if _SYSTEM_LOGGER_DIR not in sys.path:
-    sys.path.insert(0, _SYSTEM_LOGGER_DIR)
+for _p in [_PROJECT_ROOT, _SYSTEM_LOGGER_DIR]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import uvicorn
 from fastapi import FastAPI
@@ -25,7 +26,9 @@ from backends.gripper import GripperBackend
 from config import LeaseConfig, ServerConfig, ServiceManagerConfig, default_services
 from lease import LeaseManager
 from routes.ws import FeedbackBroadcaster
+from arm_monitor import ArmMonitor
 from safety import SafetyEnvelope
+from safety_monitor import SafetyMonitor
 from services import ServiceManager
 from state import StateAggregator
 
@@ -33,11 +36,9 @@ from state import StateAggregator
 from system_logger import SystemLogger, RewindOrchestrator, LoggerConfig, RewindConfig
 from system_logger.config import WorkspaceBounds
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
+from logging_config import setup_logging
+
+logger = setup_logging("agent_server")
 
 
 def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> FastAPI:
@@ -59,7 +60,7 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     camera_backend = CameraBackend(cfg.cameras, dry_run=cfg.dry_run)
 
     # -- core services -------------------------------------------------------
-    state_agg = StateAggregator(cfg, base_backend, franka_backend, gripper_backend)
+    state_agg = StateAggregator(cfg, base_backend, franka_backend, gripper_backend, camera_backend)
     safety = SafetyEnvelope(cfg.safety)
     feedback = FeedbackBroadcaster()
 
@@ -93,6 +94,15 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
         gripper_backend=gripper_backend,
     )
 
+    # Safety monitor (collision detection + boundary violations)
+    safety_monitor = SafetyMonitor(rewind_orchestrator, base_backend, state_agg)
+
+    # Arm crash recovery monitor
+    arm_monitor = ArmMonitor(
+        state_agg, franka_backend, rewind_orchestrator, cfg.franka,
+        service_manager=service_mgr,
+    )
+
     lease_mgr = LeaseManager(
         cfg.lease,
         motors_moving_fn=state_agg.motors_moving,
@@ -122,7 +132,7 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     app.include_router(state_router(state_agg, camera_backend, lease_mgr, base_backend, franka_backend, gripper_backend, system_logger))
     app.include_router(lease_router(lease_mgr))
     app.include_router(cmd_router(lease_mgr, safety, base_backend, franka_backend, gripper_backend, feedback.broadcast, state_agg, system_logger))
-    app.include_router(rewind_router(rewind_orchestrator, lease_mgr, system_logger))
+    app.include_router(rewind_router(rewind_orchestrator, lease_mgr, system_logger, safety_monitor, arm_monitor))
     app.include_router(ws_router(state_agg, feedback, cfg, camera_backend))
     app.include_router(init_code_routes(lease_mgr))
     app.include_router(sdk_docs_router)
@@ -130,7 +140,7 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     # Service manager routes (includes dashboard)
     if cfg.dashboard:
         from routes.service_routes import create_router as service_router
-        app.include_router(service_router(service_mgr))  # Pass None if disabled
+        app.include_router(service_router(service_mgr, arm_monitor=arm_monitor))
     if service_mgr is not None:
         # Wire up event broadcasting for service events
         service_mgr._on_event = feedback.broadcast
@@ -171,6 +181,12 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
         # Start unified state recording
         await system_logger.start(state_fn=lambda: state_agg.state)
 
+        # Start safety monitor (collision detection + boundary violations)
+        await safety_monitor.start()
+
+        # Start arm crash recovery monitor
+        await arm_monitor.start()
+
         logger.info("Hardware server ready on %s:%d", cfg.host, cfg.port)
 
     @app.on_event("shutdown")
@@ -187,6 +203,12 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
             executor.cleanup_temp_files()
         except Exception as e:
             logger.warning(f"Failed to cleanup code executor: {e}")
+
+        # Stop arm crash recovery monitor
+        await arm_monitor.stop()
+
+        # Stop safety monitor
+        await safety_monitor.stop()
 
         # Stop state recording
         await system_logger.stop()

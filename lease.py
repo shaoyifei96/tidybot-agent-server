@@ -51,6 +51,7 @@ class LeaseManager:
         self._resetting: bool = False
         self._reset_task: asyncio.Task | None = None
         self._on_lease_end_async: Callable[[], Awaitable[None]] | None = None
+        self._on_lease_start: Callable[[], None] | None = None
 
     @property
     def current_lease(self) -> Lease | None:
@@ -59,6 +60,14 @@ class LeaseManager:
     def set_on_lease_end(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Set async callback invoked when a lease ends (rewind + clear)."""
         self._on_lease_end_async = callback
+
+    def set_on_lease_start(self, callback: Callable[[str], None]) -> None:
+        """Set callback invoked when a lease is granted.
+
+        Args:
+            callback: Called with the holder name as argument.
+        """
+        self._on_lease_start = callback
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._check_loop())
@@ -125,6 +134,30 @@ class LeaseManager:
                 return {"status": "extended", "remaining_s": self._remaining()}
             return {"status": "not_found"}
 
+    async def clear_queue(self) -> dict:
+        """Clear queue, revoke current lease, stop code, and trigger rewind."""
+        async with self._lock:
+            # Clear queued entries first so _try_grant_next finds nothing
+            removed = 0
+            while self._queue:
+                entry = self._queue.popleft()
+                if not entry.future.done():
+                    entry.future.cancel()
+                removed += 1
+
+            had_lease = self._current is not None
+            if had_lease:
+                self._revoke("queue_cleared")
+
+            logger.info("Cleared queue (%d removed), revoked lease: %s",
+                         removed, had_lease)
+            return {
+                "status": "cleared",
+                "removed": removed,
+                "lease_revoked": had_lease,
+                "resetting": self._resetting,
+            }
+
     def record_command(self) -> None:
         """Called when operator sends a command."""
         if self._current:
@@ -165,6 +198,8 @@ class LeaseManager:
             last_cmd_at=now,
         )
         self._current = lease
+        if self._on_lease_start:
+            self._on_lease_start()
         event = {
             "type": "lease_granted",
             "lease_id": lease.lease_id,

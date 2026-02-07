@@ -266,7 +266,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span id="robot-activity" class="activity-badge idle">Idle</span>
     </div>
     <div style="margin-top: 12px;">
-      <div class="control-label" style="margin-bottom: 6px;">Queue (<span id="lease-queue-len">0</span> waiting)</div>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <span class="control-label">Queue (<span id="lease-queue-len">0</span> waiting)</span>
+        <button class="btn-action" id="btn-clear-queue" style="background: #b33; font-size: 11px; padding: 3px 10px;" onclick="clearQueue(this)">Stop &amp; Reset</button>
+      </div>
       <ul class="lease-queue-list" id="lease-queue-list">
         <li style="color: #666; font-style: italic;">Empty</li>
       </ul>
@@ -520,6 +523,25 @@ async function clearTrajectory(btn) {
     }
   } catch (e) {
     console.error("Failed to clear trajectory:", e);
+    alert("Error: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function clearQueue(btn) {
+  if (!confirm("Stop current code, clear queue, and rewind to home?")) return;
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/lease/clear-queue", { method: "POST" });
+    const result = await resp.json();
+    if (result.status === "cleared") {
+      await pollLease();
+    } else {
+      alert("Failed: " + JSON.stringify(result));
+    }
+  } catch (e) {
+    console.error("Failed to clear queue:", e);
     alert("Error: " + e.message);
   } finally {
     btn.disabled = false;
@@ -1159,6 +1181,7 @@ async function pollLease() {
     // Queue
     const queueLen = data.queue_length || 0;
     document.getElementById("lease-queue-len").textContent = queueLen;
+    document.getElementById("btn-clear-queue").style.display = (queueLen > 0 || data.holder) ? "" : "none";
     const listEl = document.getElementById("lease-queue-list");
     if (queueLen === 0) {
       listEl.innerHTML = '<li style="color: #666; font-style: italic;">Empty</li>';
@@ -1191,12 +1214,13 @@ setInterval(pollLease, 1000);
 </script></body></html>"""
 
 
-def create_router(service_mgr: ServiceManager | None):
+def create_router(service_mgr: ServiceManager | None, arm_monitor=None):
     """Create the service routes with injected dependencies.
 
     Args:
         service_mgr: ServiceManager instance, or None if service management is disabled.
                      When None, only the dashboard route is available (without service controls).
+        arm_monitor: Optional ArmMonitor to suppress/allow recovery on franka_server stop/start.
     """
     service_manager_enabled = service_mgr is not None
 
@@ -1248,17 +1272,27 @@ def create_router(service_mgr: ServiceManager | None):
         @router.post("/{name}/start")
         async def start_service(name: str):
             """Start a service."""
-            return await service_mgr.start_service(name)
+            result = await service_mgr.start_service(name)
+            if name == "franka_server" and result.get("ok") and arm_monitor is not None:
+                arm_monitor.allow_recovery()
+            return result
 
         @router.post("/{name}/stop")
         async def stop_service(name: str):
             """Stop a service."""
+            if name == "franka_server" and arm_monitor is not None:
+                arm_monitor.suppress_recovery()
             return await service_mgr.stop_service(name)
 
         @router.post("/{name}/restart")
         async def restart_service(name: str):
             """Restart a service."""
-            return await service_mgr.restart_service(name)
+            if name == "franka_server" and arm_monitor is not None:
+                arm_monitor.suppress_recovery()
+            result = await service_mgr.restart_service(name)
+            if name == "franka_server" and result.get("ok") and arm_monitor is not None:
+                arm_monitor.allow_recovery()
+            return result
 
         @router.get("/{name}/logs")
         async def get_logs(name: str, lines: int = Query(default=50, ge=1, le=1000)):

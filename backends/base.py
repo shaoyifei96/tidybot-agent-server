@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing.managers
+import time
 from typing import Any
 
 import numpy as np
@@ -35,6 +36,11 @@ class BaseBackend:
         self._base: Any = None
         self._connected = False
 
+        # Commanded velocity tracking for collision detection
+        self._last_cmd_vel: list[float] = [0.0, 0.0, 0.0]  # [vx, vy, wz]
+        self._last_cmd_time: float = 0.0
+        self._cmd_is_velocity: bool = False
+
     # -- lifecycle -----------------------------------------------------------
 
     async def connect(self) -> None:
@@ -63,14 +69,26 @@ class BaseBackend:
 
     # -- queries -------------------------------------------------------------
 
+    @property
+    def last_cmd_vel(self) -> list[float]:
+        return list(self._last_cmd_vel)
+
+    @property
+    def last_cmd_time(self) -> float:
+        return self._last_cmd_time
+
+    @property
+    def is_velocity_mode(self) -> bool:
+        return self._cmd_is_velocity
+
     def get_state(self) -> dict:
-        """Return ``{'base_pose': [x, y, theta]}``.
+        """Return ``{'base_pose': [x, y, theta], 'base_velocity': [vx, vy, wz]}``.
 
         Raises:
             BaseBackendError: If the connection to base_server is broken.
         """
         if self._dry_run:
-            return {"base_pose": [0.0, 0.0, 0.0]}
+            return {"base_pose": [0.0, 0.0, 0.0], "base_velocity": [0.0, 0.0, 0.0]}
         if self._base is None:
             raise BaseBackendError("Base backend not connected")
         try:
@@ -81,7 +99,10 @@ class BaseBackend:
         pose = raw.get("base_pose")
         if isinstance(pose, np.ndarray):
             pose = pose.tolist()
-        return {"base_pose": pose}
+        velocity = raw.get("base_velocity", [0.0, 0.0, 0.0])
+        if isinstance(velocity, np.ndarray):
+            velocity = velocity.tolist()
+        return {"base_pose": pose, "base_velocity": velocity}
 
     # -- commands ------------------------------------------------------------
 
@@ -103,6 +124,8 @@ class BaseBackend:
     def execute_action(self, x: float, y: float, theta: float) -> None:
         if self._dry_run:
             return
+        self._cmd_is_velocity = False
+        self._last_cmd_vel = [0.0, 0.0, 0.0]
         self._call_base("execute_action", {"base_pose": np.array([x, y, theta])})
 
     def set_target_velocity(
@@ -110,11 +133,16 @@ class BaseBackend:
     ) -> None:
         if self._dry_run:
             return
+        self._last_cmd_vel = [vx, vy, wz]
+        self._last_cmd_time = time.time()
+        self._cmd_is_velocity = True
         self._call_base("set_target_velocity", [vx, vy, wz], frame=frame)
 
     def stop(self) -> None:
         if self._dry_run:
             return
+        self._cmd_is_velocity = False
+        self._last_cmd_vel = [0.0, 0.0, 0.0]
         self._call_base("stop")
 
     def reset(self) -> None:

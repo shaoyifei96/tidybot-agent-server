@@ -13,6 +13,7 @@ import numpy as np
 from backends.base import BaseBackend
 from backends.franka import FrankaBackend
 from backends.gripper import GripperBackend
+from backends.cameras import CameraBackend
 from config import ServerConfig
 
 logger = logging.getLogger(__name__)
@@ -64,16 +65,19 @@ class StateAggregator:
         base: BaseBackend,
         franka: FrankaBackend,
         gripper: GripperBackend,
+        camera: CameraBackend | None = None,
     ) -> None:
         self._cfg = config
         self._base = base
         self._franka = franka
         self._gripper = gripper
+        self._camera = camera
         self._state: dict[str, Any] = {}
         self._task: asyncio.Task | None = None
         self._last_base_reconnect: float = 0.0
         self._last_franka_reconnect: float = 0.0
         self._last_gripper_reconnect: float = 0.0
+        self._last_camera_reconnect: float = 0.0
 
     @property
     def state(self) -> dict[str, Any]:
@@ -90,9 +94,9 @@ class StateAggregator:
         if gripper.get("is_moving", False):
             return True
         base = self._state.get("base", {})
-        pose = base.get("pose", [0, 0, 0])
-        # Base doesn't expose velocity directly; we'd need to diff poses.
-        # For now, rely on arm velocity only.
+        vel = base.get("velocity", [0, 0, 0])
+        if any(abs(v) > 0.01 for v in vel):
+            return True
         return False
 
     async def start(self) -> None:
@@ -140,6 +144,16 @@ class StateAggregator:
                 except Exception as e:
                     logger.debug("Gripper backend reconnect failed: %s", e)
 
+        # Try to reconnect camera backend
+        if self._camera and not self._camera.is_connected:
+            if now - self._last_camera_reconnect > RECONNECT_INTERVAL:
+                self._last_camera_reconnect = now
+                try:
+                    await self._camera.start()
+                    logger.info("Reconnected to camera backend")
+                except Exception as e:
+                    logger.debug("Camera backend reconnect failed: %s", e)
+
     async def _poll_loop(self) -> None:
         interval = 1.0 / self._cfg.base.poll_hz
         while True:
@@ -173,12 +187,13 @@ class StateAggregator:
                         logger.debug("Gripper state poll failed: %s", e)
 
                 base_pose = base_state.get("base_pose", [0, 0, 0])
+                base_velocity = base_state.get("base_velocity", [0, 0, 0])
                 ee_pose = franka_state.get("ee_pose", [])
                 world_ee_pose = compute_world_ee_pose(base_pose, ee_pose) if ee_pose else []
 
                 self._state = {
                     "timestamp": time.time(),
-                    "base": {"pose": base_pose},
+                    "base": {"pose": base_pose, "velocity": base_velocity},
                     "arm": {
                         "q": franka_state.get("q", []),
                         "dq": franka_state.get("dq", []),

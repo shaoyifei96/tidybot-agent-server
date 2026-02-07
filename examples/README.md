@@ -71,7 +71,9 @@ with open("minimal_test.py") as f:
 resp = requests.post(f"{URL}/code/execute", headers=headers, json={"code": code})
 print(f"Execution ID: {resp.json()['execution_id']}")
 
-# Wait for completion
+# Wait for completion — IMPORTANT: you MUST wait until status is no longer
+# "running" before releasing the lease. Poll until a terminal state is reached
+# ("completed", "failed", "timeout", or "stopped").
 while requests.get(f"{URL}/code/status").json()["is_running"]:
     time.sleep(0.5)
 
@@ -83,7 +85,7 @@ print(f"Output:\n{result['stdout']}")
 if result['stderr']:
     print(f"Errors:\n{result['stderr']}")
 
-# Release lease
+# Release lease — only after execution has finished (status != "running")
 requests.post(f"{URL}/lease/release", json={"lease_id": lease_id})
 ```
 

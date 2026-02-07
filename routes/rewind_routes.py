@@ -43,6 +43,9 @@ class MonitorConfigUpdate(BaseModel):
     auto_rewind_percentage: Optional[float] = None
     manual_rewind_percentage: Optional[float] = None
     monitor_interval: Optional[float] = None
+    collision_velocity_threshold: Optional[float] = Field(None, ge=0, le=1)
+    collision_min_cmd_speed: Optional[float] = Field(None, ge=0)
+    collision_grace_period: Optional[float] = Field(None, ge=0)
 
 
 class ResetToHomeRequest(BaseModel):
@@ -63,7 +66,7 @@ def _format_result(result) -> dict:
     }
 
 
-def create_router(rewind_orchestrator, lease_mgr, system_logger):
+def create_router(rewind_orchestrator, lease_mgr, system_logger, safety_monitor=None, arm_monitor=None):
     """Create rewind routes with injected dependencies."""
 
     def _check_lease(lease_id: Optional[str]) -> None:
@@ -80,12 +83,18 @@ def create_router(rewind_orchestrator, lease_mgr, system_logger):
         except Exception as e:
             boundary = {"error": str(e)}
 
-        return {
+        result = {
             "is_rewinding": rewind_orchestrator.is_rewinding,
             "trajectory_length": rewind_orchestrator.trajectory_length,
             "trajectory_info": system_logger.get_trajectory_info(),
             "base_boundary_status": boundary,  # Dashboard expects this name
+            "collision_detected": False,
         }
+        if safety_monitor is not None:
+            result["collision_detected"] = safety_monitor.collision_detected
+        if arm_monitor is not None:
+            result["arm_recovering"] = arm_monitor.is_recovering
+        return result
 
     @router.get("/logs")
     async def get_logs(limit: int = 50):
@@ -266,7 +275,7 @@ def create_router(rewind_orchestrator, lease_mgr, system_logger):
     async def get_monitor_status():
         """Get safety monitor status (dashboard compatibility)."""
         cfg = rewind_orchestrator.config
-        return {
+        result = {
             "is_running": True,
             "auto_rewind_enabled": cfg.auto_rewind_enabled,
             "auto_rewind_percentage": cfg.auto_rewind_percentage,
@@ -275,7 +284,18 @@ def create_router(rewind_orchestrator, lease_mgr, system_logger):
             "auto_rewind_count": 0,
             "last_auto_rewind_time": None,
             "is_currently_rewinding": rewind_orchestrator.is_rewinding,
+            "collision_detected": False,
+            "collision_velocity_threshold": cfg.collision_velocity_threshold,
+            "collision_min_cmd_speed": cfg.collision_min_cmd_speed,
+            "collision_grace_period": cfg.collision_grace_period,
         }
+        if safety_monitor is not None:
+            result["auto_rewind_count"] = safety_monitor.auto_rewind_count
+            result["last_auto_rewind_time"] = safety_monitor.last_auto_rewind_time
+            result["collision_detected"] = safety_monitor.collision_detected
+        if arm_monitor is not None:
+            result["arm_monitor"] = arm_monitor.get_status()
+        return result
 
     @router.put("/monitor/config")
     async def update_monitor_config(req: MonitorConfigUpdate):
@@ -289,6 +309,12 @@ def create_router(rewind_orchestrator, lease_mgr, system_logger):
             _manual_rewind_pct["value"] = req.manual_rewind_percentage
         if req.monitor_interval is not None:
             cfg.monitor_interval = req.monitor_interval
+        if req.collision_velocity_threshold is not None:
+            cfg.collision_velocity_threshold = req.collision_velocity_threshold
+        if req.collision_min_cmd_speed is not None:
+            cfg.collision_min_cmd_speed = req.collision_min_cmd_speed
+        if req.collision_grace_period is not None:
+            cfg.collision_grace_period = req.collision_grace_period
         return await get_monitor_status()
 
     @router.post("/monitor/enable")

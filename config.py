@@ -162,7 +162,7 @@ class GripperBackendConfig:
 @dataclass
 class CameraBackendConfig:
     """Configuration for camera backend (WebSocket client to camera_server)."""
-    enabled: bool = False
+    enabled: bool = True
     host: str = "localhost"
     port: int = 5580                    # camera_server WebSocket port
     timeout: float = 10.0               # connection timeout
@@ -182,8 +182,8 @@ class SafetyConfig:
     arm_workspace_min: list[float] = field(default_factory=lambda: [-0.8, -0.8, 0.0])
     arm_workspace_max: list[float] = field(default_factory=lambda: [0.8, 0.8, 1.2])
     # Base workspace bounding box [min, max] for x, y (meters)
-    base_workspace_min: list[float] = field(default_factory=lambda: [-0.25, -0.25])
-    base_workspace_max: list[float] = field(default_factory=lambda: [0.25, 0.25])
+    base_workspace_min: list[float] = field(default_factory=lambda: [-1, -1])
+    base_workspace_max: list[float] = field(default_factory=lambda: [1, 1])
     # Max velocities
     base_max_linear_vel: float = 0.5  # m/s
     base_max_angular_vel: float = 1.57  # rad/s
@@ -194,7 +194,7 @@ class SafetyConfig:
 
 @dataclass
 class LeaseConfig:
-    idle_timeout_s: float = 30.0
+    idle_timeout_s: float = 15.0
     warning_grace_s: float = 10.0
     max_duration_s: float = 300.0
     check_interval_s: float = 1.0
