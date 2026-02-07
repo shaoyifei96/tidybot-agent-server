@@ -39,7 +39,6 @@ class FrankaBackend:
             os.path.dirname(__file__),
             "..",
             "..",
-            "franka_ZMQ",
             "franka_interact",
             "franka_server",
         )

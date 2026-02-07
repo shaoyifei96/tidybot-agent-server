@@ -63,7 +63,7 @@ def default_services() -> dict[str, ServiceDefinition]:
             name="Whole-Body Controller",
             cmd="python3 -u qp_arm_only.py",
             cwd=os.path.join(_PROJECT_ROOT, "tidybot2"),
-            shell_prefix=f"source {os.path.join(_PROJECT_ROOT, 'franka_ZMQ', '.venv_franka_interact', 'bin', 'activate')} && ",
+            shell_prefix=f"source {os.path.join(_PROJECT_ROOT, 'franka_interact', '.venv', 'bin', 'activate')} && ",
             kill_patterns=["qp_arm_only.py"],
             depends_on=["base_server", "franka_server"],
         ),
