@@ -14,17 +14,20 @@ def create_router(state_agg, camera_backend, lease_mgr, base_backend, franka_bac
     async def get_state():
         return state_agg.state
 
+    # Headers to prevent browser/proxy caching of camera frames
+    _no_cache_headers = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
     @router.get("/state/cameras")
     async def get_camera_frame(device: Optional[str] = None):
         """Get latest camera frame as JPEG.
-        
+
         Args:
             device: Optional device ID to get frame from
         """
         frame = camera_backend.get_frame(device)
         if frame is None:
             return JSONResponse({"error": "no camera frame available"}, status_code=503)
-        return Response(content=frame, media_type="image/jpeg")
+        return Response(content=frame, media_type="image/jpeg", headers=_no_cache_headers)
 
     @router.get("/cameras")
     async def list_cameras():
@@ -40,26 +43,43 @@ def create_router(state_agg, camera_backend, lease_mgr, base_backend, franka_bac
     @router.get("/cameras/{device_id}/frame")
     async def get_device_frame(device_id: str, stream: str = "color"):
         """Get frame from specific camera device.
-        
+
         Args:
-            device_id: Camera device identifier
+            device_id: Camera device identifier (or "any" for first available)
             stream: Stream type (color, depth)
         """
+        resolved = None if device_id == "any" else device_id
         if stream == "color":
-            frame = camera_backend.get_frame(device_id)
+            frame = camera_backend.get_frame(resolved)
             if frame is None:
                 return JSONResponse({"error": "no frame available"}, status_code=503)
-            return Response(content=frame, media_type="image/jpeg")
+            return Response(content=frame, media_type="image/jpeg", headers=_no_cache_headers)
         else:
             # For depth, get raw decoded frame
-            decoded = camera_backend.get_latest_decoded_frame(stream, device_id)
+            decoded = camera_backend.get_latest_decoded_frame(stream, resolved)
             if decoded is None:
                 return JSONResponse({"error": f"no {stream} frame available"}, status_code=503)
-            
-            # Return as JSON with metadata
+
             import cv2
             _, png = cv2.imencode(".png", decoded.frame)
-            return Response(content=png.tobytes(), media_type="image/png")
+            return Response(content=png.tobytes(), media_type="image/png", headers=_no_cache_headers)
+
+    @router.get("/cameras/{device_id}/intrinsics")
+    async def get_device_intrinsics(device_id: str, stream: str = "color"):
+        """Get camera intrinsics (focal length, principal point, depth scale).
+
+        Args:
+            device_id: Camera device identifier (or "any" for first available)
+            stream: Stream type (color, depth)
+
+        Returns:
+            JSON with {fx, fy, ppx, ppy, width, height, depth_scale, ...}
+        """
+        resolved = None if device_id == "any" else device_id
+        intrinsics = camera_backend.get_intrinsics(resolved, stream)
+        if intrinsics is None:
+            return JSONResponse({"error": "intrinsics not available"}, status_code=503)
+        return intrinsics
 
     @router.get("/trajectory")
     async def get_trajectory():

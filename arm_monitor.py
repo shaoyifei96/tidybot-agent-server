@@ -299,7 +299,7 @@ class ArmMonitor:
             executor = get_executor()
             if executor.is_running:
                 logger.info("ArmMonitor: stopping running code execution")
-                executor.stop()
+                executor.stop(reason="arm_error")
         except Exception as e:
             logger.warning("ArmMonitor: failed to stop code execution: %s", e)
 

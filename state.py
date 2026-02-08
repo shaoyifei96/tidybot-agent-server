@@ -78,26 +78,41 @@ class StateAggregator:
         self._last_franka_reconnect: float = 0.0
         self._last_gripper_reconnect: float = 0.0
         self._last_camera_reconnect: float = 0.0
+        # Position-delta tracking for movement detection
+        self._prev_arm_q: list[float] = []
+        self._prev_base_pose: list[float] = []
+        self._prev_gripper_pos: float = 0.0
+        self._last_moved_at: float = 0.0
 
     @property
     def state(self) -> dict[str, Any]:
         return dict(self._state)
 
-    def motors_moving(self) -> bool:
-        """Return True if any motor has significant velocity."""
-        arm = self._state.get("arm", {})
-        dq = arm.get("dq", [])
-        if any(abs(v) > 0.01 for v in dq):
-            return True
-        # Check if gripper is moving
-        gripper = self._state.get("gripper", {})
-        if gripper.get("is_moving", False):
-            return True
-        base = self._state.get("base", {})
-        vel = base.get("velocity", [0, 0, 0])
-        if any(abs(v) > 0.01 for v in vel):
-            return True
-        return False
+    def last_moved_at(self) -> float:
+        """Return timestamp of last detected robot movement."""
+        return self._last_moved_at
+
+    def _update_movement_tracking(self, arm_q: list, base_pose: list, gripper_pos: float) -> None:
+        """Compare current positions to previous and update last_moved_at."""
+        moved = False
+
+        if arm_q and self._prev_arm_q:
+            if any(abs(a - b) > 0.005 for a, b in zip(arm_q, self._prev_arm_q)):
+                moved = True
+        if base_pose and self._prev_base_pose:
+            if any(abs(a - b) > 0.005 for a, b in zip(base_pose, self._prev_base_pose)):
+                moved = True
+        if self._prev_gripper_pos and abs(gripper_pos - self._prev_gripper_pos) > 0.5:
+            moved = True
+
+        if arm_q:
+            self._prev_arm_q = list(arm_q)
+        if base_pose:
+            self._prev_base_pose = list(base_pose)
+        self._prev_gripper_pos = gripper_pos
+
+        if moved:
+            self._last_moved_at = time.time()
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._poll_loop())
@@ -120,7 +135,8 @@ class StateAggregator:
                 self._last_base_reconnect = now
                 try:
                     await self._base.connect()
-                    logger.info("Reconnected to base backend")
+                    if self._base.is_connected:
+                        logger.info("Reconnected to base backend")
                 except Exception as e:
                     logger.debug("Base backend reconnect failed: %s", e)
 
@@ -130,7 +146,8 @@ class StateAggregator:
                 self._last_franka_reconnect = now
                 try:
                     await self._franka.connect()
-                    logger.info("Reconnected to franka backend")
+                    if self._franka.is_connected:
+                        logger.info("Reconnected to franka backend")
                 except Exception as e:
                     logger.debug("Franka backend reconnect failed: %s", e)
 
@@ -140,7 +157,8 @@ class StateAggregator:
                 self._last_gripper_reconnect = now
                 try:
                     await self._gripper.connect()
-                    logger.info("Reconnected to gripper backend")
+                    if self._gripper.is_connected:
+                        logger.info("Reconnected to gripper backend")
                 except Exception as e:
                     logger.debug("Gripper backend reconnect failed: %s", e)
 
@@ -150,7 +168,8 @@ class StateAggregator:
                 self._last_camera_reconnect = now
                 try:
                     await self._camera.start()
-                    logger.info("Reconnected to camera backend")
+                    if self._camera.is_connected:
+                        logger.info("Reconnected to camera backend")
                 except Exception as e:
                     logger.debug("Camera backend reconnect failed: %s", e)
 
@@ -190,12 +209,17 @@ class StateAggregator:
                 base_velocity = base_state.get("base_velocity", [0, 0, 0])
                 ee_pose = franka_state.get("ee_pose", [])
                 world_ee_pose = compute_world_ee_pose(base_pose, ee_pose) if ee_pose else []
+                arm_q = franka_state.get("q", [])
+                gripper_pos = gripper_state.get("position_mm", 0.0)
+
+                # Track position deltas for movement detection
+                self._update_movement_tracking(arm_q, base_pose, gripper_pos)
 
                 self._state = {
                     "timestamp": time.time(),
                     "base": {"pose": base_pose, "velocity": base_velocity},
                     "arm": {
-                        "q": franka_state.get("q", []),
+                        "q": arm_q,
                         "dq": franka_state.get("dq", []),
                         "ee_pose": ee_pose,
                         "ee_pose_world": world_ee_pose,
@@ -204,7 +228,7 @@ class StateAggregator:
                     },
                     "gripper": {
                         "position": gripper_state.get("position", 0),
-                        "position_mm": gripper_state.get("position_mm", 0.0),
+                        "position_mm": gripper_pos,
                         "is_activated": gripper_state.get("is_activated", False),
                         "is_moving": gripper_state.get("is_moving", False),
                         "object_detected": gripper_state.get("object_detected", False),
@@ -213,7 +237,7 @@ class StateAggregator:
                         "fault_code": gripper_state.get("fault_code", 0),
                         "fault_message": gripper_state.get("fault_message", ""),
                     },
-                    "motors_moving": self.motors_moving(),
+                    "last_moved_at": self._last_moved_at,
                 }
             except Exception:
                 logger.exception("State poll error")

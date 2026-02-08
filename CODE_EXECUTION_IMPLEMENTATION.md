@@ -238,7 +238,7 @@ cd examples
 - [x] API endpoints for code execution (`/code/execute`, `/code/stop`, `/code/status`, `/code/result`)
 - [x] Server integration and background task tracking
 - [x] Graceful backend connection handling (unavailable backends print warning, don't crash)
-- [x] Control mode auto-switching (JOINT_POSITION, CARTESIAN_POSE)
+- [x] Control mode auto-switching (JOINT_POSITION, CARTESIAN_IMPEDANCE)
 - [x] Streaming command pattern (50 Hz like rewind) for reliable motion
 - [x] Example skills (minimal_test.py, joint_move_test.py, pick_and_place.py)
 - [x] Test script for API validation (test_execution.sh)
@@ -286,7 +286,7 @@ Moving back to original position...
 **Control Mode Must Be Set**: The Franka arm requires the correct control mode before accepting commands:
 - Mode 0 = IDLE (commands ignored)
 - Mode 1 = JOINT_POSITION (for `move_joints()`)
-- Mode 4 = CARTESIAN_POSE (for `move_to_pose()`)
+- Mode 7 = CARTESIAN_IMPEDANCE (for `move_to_pose()`, `move_delta()`)
 
 The SDK automatically sets the control mode, but if using `franka_backend` directly:
 ```python

@@ -34,7 +34,7 @@ class ArmAPI:
 
     Note:
         Commands are sent at 50 Hz internally until target is reached.
-        Control mode is set automatically (JOINT_POSITION or CARTESIAN_POSE).
+        Control mode is set automatically (JOINT_POSITION or CARTESIAN_IMPEDANCE).
     """
 
     # Control mode constants
@@ -42,7 +42,6 @@ class ArmAPI:
     MODE_JOINT_POSITION = 1
     MODE_JOINT_VELOCITY = 2
     MODE_TORQUE = 3
-    MODE_CARTESIAN_POSE = 4
     MODE_CARTESIAN_VELOCITY = 5
     MODE_CARTESIAN_IMPEDANCE = 7
 
@@ -162,8 +161,8 @@ class ArmAPI:
     ) -> None:
         """Move end-effector to cartesian pose with smooth interpolation (blocking).
 
-        Interpolates from current pose to target using cubic ease-in-out
-        for smooth, jerk-free motion. Sends commands at 50 Hz.
+        Interpolates position from current to target using cubic ease-in-out
+        at 50 Hz. Orientation is kept constant (start or specified RPY).
 
         Args:
             x, y, z: Position in meters (optional, keeps current if None)
@@ -174,14 +173,15 @@ class ArmAPI:
         Raises:
             ArmError: If command fails or timeout
         """
+        timeout = timeout or self._timeout
+
         # Get fresh current pose (read multiple times to ensure fresh)
         for _ in range(3):
             state = self._backend.get_state()
             time.sleep(0.02)
         current_pose = state.get("ee_pose", [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
-        start_pose = list(current_pose)
 
-        # Extract current position and rotation
+        # Extract current position
         current_x, current_y, current_z = current_pose[12], current_pose[13], current_pose[14]
 
         # Use provided values or keep current
@@ -189,51 +189,40 @@ class ArmAPI:
         target_y = y if y is not None else current_y
         target_z = z if z is not None else current_z
 
+        # Extract current rotation
+        current_rot = self._extract_rot(current_pose)
+
         # For orientation, if any RPY is specified, use them; otherwise keep current rotation
         if roll is not None or pitch is not None or yaw is not None:
-            # Use provided values or zero for unspecified
             r = roll if roll is not None else 0.0
             p = pitch if pitch is not None else 0.0
             y_angle = yaw if yaw is not None else 0.0
-
-            # Convert RPY to rotation matrix
-            rot_matrix = self._rpy_to_matrix(r, p, y_angle)
+            target_rot = self._rpy_to_matrix(r, p, y_angle)
         else:
-            # Keep current rotation (top-left 3x3 of pose matrix)
-            rot_matrix = np.array([
-                [current_pose[0], current_pose[4], current_pose[8]],
-                [current_pose[1], current_pose[5], current_pose[9]],
-                [current_pose[2], current_pose[6], current_pose[10]],
-            ])
+            target_rot = current_rot.copy()
 
-        # Build 4x4 transformation matrix (column-major)
-        target_pose = [
-            rot_matrix[0, 0], rot_matrix[1, 0], rot_matrix[2, 0], 0.0,
-            rot_matrix[0, 1], rot_matrix[1, 1], rot_matrix[2, 1], 0.0,
-            rot_matrix[0, 2], rot_matrix[1, 2], rot_matrix[2, 2], 0.0,
-            target_x, target_y, target_z, 1.0,
-        ]
+        # Precompute quaternions for SLERP
+        q_start = self._mat_to_quat(current_rot)
+        q_end = self._mat_to_quat(target_rot)
 
-        # Calculate Cartesian distance for auto-duration
-        distance = (
-            (target_x - current_x)**2 +
-            (target_y - current_y)**2 +
-            (target_z - current_z)**2
-        ) ** 0.5
-
-        # Auto-adjust duration: ~5 cm/s effective speed, minimum 2s
+        # Auto-calculate duration from distance (0.1 m/s nominal speed, min 2s)
         if duration is None:
-            duration = max(2.0, min(15.0, distance / 0.05 * 2.0))
+            dist = ((target_x - current_x)**2 + (target_y - current_y)**2 + (target_z - current_z)**2) ** 0.5
+            duration = max(2.0, min(10.0, dist / 0.1))
 
-        timeout = timeout or self._timeout
+        # Set impedance mode and gains
+        self._backend.set_control_mode(self.MODE_CARTESIAN_IMPEDANCE)
+        time.sleep(0.05)
+        self._backend.set_gains(
+            cartesian_stiffness=self._DEFAULT_CART_STIFFNESS,
+            cartesian_damping=self._DEFAULT_CART_DAMPING,
+        )
+        print(f"[arm] Cartesian impedance gains: K={self._DEFAULT_CART_STIFFNESS} D={self._DEFAULT_CART_DAMPING}")
+        time.sleep(0.05)
 
-        # Set control mode to CARTESIAN_POSE
-        self._backend.set_control_mode(self.MODE_CARTESIAN_POSE)
-        time.sleep(0.1)  # Wait for mode switch
-
-        # Send current pose first to establish command stream (avoids initial jump)
+        # Send current pose first to establish command stream (avoids jump)
         for _ in range(5):
-            self._backend.send_cartesian_pose(start_pose)
+            self._backend.send_cartesian_pose(list(current_pose), blocking=False)
             time.sleep(0.02)
 
         # Interpolate smoothly from start to target
@@ -243,37 +232,39 @@ class ArmAPI:
 
         while time.time() - start_time < timeout:
             elapsed = time.time() - motion_start_time
-            t = min(1.0, elapsed / duration)  # Normalized time [0, 1]
+            t = min(1.0, elapsed / duration)
 
             # Cubic ease-in-out interpolation
             alpha = self._cubic_ease_in_out(t)
 
-            # Interpolate all 16 elements of the pose matrix
-            interp_pose = [
-                start_pose[i] + alpha * (target_pose[i] - start_pose[i])
-                for i in range(16)
-            ]
+            # Interpolate position
+            interp_x = current_x + alpha * (target_x - current_x)
+            interp_y = current_y + alpha * (target_y - current_y)
+            interp_z = current_z + alpha * (target_z - current_z)
 
-            # Send interpolated command
-            self._backend.send_cartesian_pose(interp_pose)
+            # Interpolate orientation via SLERP
+            q_interp = self._slerp(q_start, q_end, alpha)
+            interp_rot = self._quat_to_mat(q_interp)
+
+            interp_pose = self._build_pose(interp_rot, interp_x, interp_y, interp_z)
+
+            self._backend.send_cartesian_pose(interp_pose, blocking=False)
 
             # Check if motion complete
             if t >= 1.0:
-                # Verify we've reached target
                 state = self._backend.get_state()
-                current_pose = state.get("ee_pose", [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1])
+                ee = state.get("ee_pose", current_pose)
                 dq = state.get("dq", [0.0] * 7)
 
                 pos_error = (
-                    (current_pose[12] - target_x)**2 +
-                    (current_pose[13] - target_y)**2 +
-                    (current_pose[14] - target_z)**2
+                    (ee[12] - target_x)**2 +
+                    (ee[13] - target_y)**2 +
+                    (ee[14] - target_z)**2
                 ) ** 0.5
 
                 max_vel = max(abs(v) for v in dq)
 
-                # Done if close to target and not moving much
-                if pos_error < 0.005 and max_vel < 0.05:  # 5mm, low velocity
+                if pos_error < 0.03 and max_vel < 0.05:  # 3cm, low velocity
                     return
 
             time.sleep(command_interval)
@@ -281,30 +272,32 @@ class ArmAPI:
         raise ArmError("Timeout waiting for arm to reach target pose")
 
     # Default Cartesian impedance gains (matching tested native values)
-    _DEFAULT_CART_STIFFNESS = [1500, 1500, 1500, 100, 100, 100]
-    _DEFAULT_CART_DAMPING = [80, 80, 80, 10, 10, 10]
+    _DEFAULT_CART_STIFFNESS = [375, 375, 375, 25, 25, 25]
+    _DEFAULT_CART_DAMPING = [38.7, 38.7, 38.7, 10, 10, 10]
 
     def move_delta(
         self,
         dx: float = 0.0,
         dy: float = 0.0,
         dz: float = 0.0,
+        droll: float = 0.0,
+        dpitch: float = 0.0,
+        dyaw: float = 0.0,
         frame: str = "base",
         timeout: Optional[float] = None,
         duration: Optional[float] = None,
     ) -> None:
-        """Move end-effector by delta using Cartesian impedance control (blocking).
+        """Move end-effector by delta with smooth interpolation (blocking).
 
-        Uses the server's impedance controller for smooth, compliant motion.
-        Only the final target pose is specified — the server handles the motion
-        profile internally.
+        Interpolates position and orientation from current to target using
+        cubic ease-in-out at 50 Hz. Orientation uses SLERP.
 
         Args:
             dx, dy, dz: Delta position in meters
+            droll, dpitch, dyaw: Delta orientation in radians
             frame: "base" (default) or "ee" (end-effector frame)
             timeout: Optional timeout in seconds (default: 30s)
-            duration: Unused (kept for API compatibility). The impedance
-                controller determines motion speed via its gains.
+            duration: Motion duration in seconds (default: auto-calculated from distance)
 
         Raises:
             ArmError: If command fails or timeout
@@ -321,28 +314,42 @@ class ArmAPI:
         current_y = current_pose[13]
         current_z = current_pose[14]
 
+        current_rot = self._extract_rot(current_pose)
+
         if frame == "base":
             target_x = current_x + dx
             target_y = current_y + dy
             target_z = current_z + dz
         elif frame == "ee":
-            rot_matrix = np.array([
-                [current_pose[0], current_pose[4], current_pose[8]],
-                [current_pose[1], current_pose[5], current_pose[9]],
-                [current_pose[2], current_pose[6], current_pose[10]],
-            ])
-            delta_base = rot_matrix @ np.array([dx, dy, dz])
+            delta_base = current_rot @ np.array([dx, dy, dz])
             target_x = current_x + delta_base[0]
             target_y = current_y + delta_base[1]
             target_z = current_z + delta_base[2]
         else:
             raise ArmError(f"Invalid frame: {frame}. Must be 'base' or 'ee'")
 
-        # Build target pose: current orientation + target position (column-major)
-        target_pose = list(current_pose)
-        target_pose[12] = target_x
-        target_pose[13] = target_y
-        target_pose[14] = target_z
+        # Compute target orientation
+        if droll != 0.0 or dpitch != 0.0 or dyaw != 0.0:
+            delta_rot = self._rpy_to_matrix(droll, dpitch, dyaw)
+            if frame == "ee":
+                # Delta in EE frame: R_target = R_current @ R_delta
+                target_rot = current_rot @ delta_rot
+            else:
+                # Delta in base frame: R_target = R_delta @ R_current
+                target_rot = delta_rot @ current_rot
+        else:
+            target_rot = current_rot.copy()
+
+        # Precompute quaternions for SLERP
+        q_start = self._mat_to_quat(current_rot)
+        q_end = self._mat_to_quat(target_rot)
+
+        # Auto-calculate duration from distance and rotation (min 2s)
+        if duration is None:
+            dist = ((target_x - current_x)**2 + (target_y - current_y)**2 + (target_z - current_z)**2) ** 0.5
+            pos_time = dist / 0.1  # 0.1 m/s
+            rot_time = max(abs(droll), abs(dpitch), abs(dyaw)) / 0.3  # 0.3 rad/s
+            duration = max(2.0, min(10.0, max(pos_time, rot_time)))
 
         # Set impedance mode and gains
         self._backend.set_control_mode(self.MODE_CARTESIAN_IMPEDANCE)
@@ -351,34 +358,59 @@ class ArmAPI:
             cartesian_stiffness=self._DEFAULT_CART_STIFFNESS,
             cartesian_damping=self._DEFAULT_CART_DAMPING,
         )
+        print(f"[arm] Cartesian impedance gains: K={self._DEFAULT_CART_STIFFNESS} D={self._DEFAULT_CART_DAMPING}")
         time.sleep(0.05)
 
-        # Stream target pose at 50Hz until convergence
+        # Send current pose first to establish command stream (avoids jump)
+        for _ in range(5):
+            self._backend.send_cartesian_pose(list(current_pose), blocking=False)
+            time.sleep(0.02)
+
+        # Interpolate smoothly from start to target
         command_interval = 1.0 / self._command_rate
-        start_time = time.time()
+        motion_start_time = time.time()
+        start_time = motion_start_time
 
         while time.time() - start_time < timeout:
-            self._backend.send_cartesian_pose(target_pose, blocking=False)
+            elapsed = time.time() - motion_start_time
+            t = min(1.0, elapsed / duration)
 
-            # Check convergence
-            state = self._backend.get_state()
-            ee = state.get("ee_pose", current_pose)
-            dq = state.get("dq", [0.0] * 7)
+            # Cubic ease-in-out interpolation
+            alpha = self._cubic_ease_in_out(t)
 
-            pos_error = (
-                (ee[12] - target_x)**2 +
-                (ee[13] - target_y)**2 +
-                (ee[14] - target_z)**2
-            ) ** 0.5
+            # Interpolate position
+            interp_x = current_x + alpha * (target_x - current_x)
+            interp_y = current_y + alpha * (target_y - current_y)
+            interp_z = current_z + alpha * (target_z - current_z)
 
-            max_vel = max(abs(v) for v in dq)
+            # Interpolate orientation via SLERP
+            q_interp = self._slerp(q_start, q_end, alpha)
+            interp_rot = self._quat_to_mat(q_interp)
 
-            if pos_error < 0.005 and max_vel < 0.05:  # 5mm, low velocity
-                return
+            interp_pose = self._build_pose(interp_rot, interp_x, interp_y, interp_z)
+
+            self._backend.send_cartesian_pose(interp_pose, blocking=False)
+
+            # Check if motion complete
+            if t >= 1.0:
+                state = self._backend.get_state()
+                ee = state.get("ee_pose", current_pose)
+                dq = state.get("dq", [0.0] * 7)
+
+                pos_error = (
+                    (ee[12] - target_x)**2 +
+                    (ee[13] - target_y)**2 +
+                    (ee[14] - target_z)**2
+                ) ** 0.5
+
+                max_vel = max(abs(v) for v in dq)
+
+                if pos_error < 0.03 and max_vel < 0.05:  # 3cm, low velocity
+                    return
 
             time.sleep(command_interval)
 
-        raise ArmError("Timeout waiting for arm to reach target pose (impedance)")
+        raise ArmError("Timeout waiting for arm to reach target pose")
 
     def get_state(self) -> dict:
         """Get current arm state.
@@ -431,3 +463,81 @@ class ArmAPI:
             [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
             [-sp, cp * sr, cp * cr],
         ])
+
+    @staticmethod
+    def _mat_to_quat(R: np.ndarray) -> np.ndarray:
+        """Convert 3x3 rotation matrix to quaternion [w, x, y, z]."""
+        trace = R[0, 0] + R[1, 1] + R[2, 2]
+        if trace > 0:
+            s = 0.5 / np.sqrt(trace + 1.0)
+            w = 0.25 / s
+            x = (R[2, 1] - R[1, 2]) * s
+            y = (R[0, 2] - R[2, 0]) * s
+            z = (R[1, 0] - R[0, 1]) * s
+        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            w = (R[2, 1] - R[1, 2]) / s
+            x = 0.25 * s
+            y = (R[0, 1] + R[1, 0]) / s
+            z = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            w = (R[0, 2] - R[2, 0]) / s
+            x = (R[0, 1] + R[1, 0]) / s
+            y = 0.25 * s
+            z = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            w = (R[1, 0] - R[0, 1]) / s
+            x = (R[0, 2] + R[2, 0]) / s
+            y = (R[1, 2] + R[2, 1]) / s
+            z = 0.25 * s
+        q = np.array([w, x, y, z])
+        return q / np.linalg.norm(q)
+
+    @staticmethod
+    def _quat_to_mat(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
+        w, x, y, z = q
+        return np.array([
+            [1 - 2*(y*y + z*z), 2*(x*y - w*z),     2*(x*z + w*y)],
+            [2*(x*y + w*z),     1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+            [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+        ])
+
+    @staticmethod
+    def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+        """Spherical linear interpolation between two quaternions."""
+        dot = np.dot(q0, q1)
+        # Ensure shortest path
+        if dot < 0:
+            q1 = -q1
+            dot = -dot
+        dot = min(dot, 1.0)
+        if dot > 0.9995:
+            # Very close — use linear interpolation
+            result = q0 + t * (q1 - q0)
+            return result / np.linalg.norm(result)
+        theta = np.arccos(dot)
+        sin_theta = np.sin(theta)
+        a = np.sin((1 - t) * theta) / sin_theta
+        b = np.sin(t * theta) / sin_theta
+        result = a * q0 + b * q1
+        return result / np.linalg.norm(result)
+
+    def _extract_rot(self, pose: list) -> np.ndarray:
+        """Extract 3x3 rotation matrix from column-major flat pose."""
+        return np.array([
+            [pose[0], pose[4], pose[8]],
+            [pose[1], pose[5], pose[9]],
+            [pose[2], pose[6], pose[10]],
+        ])
+
+    def _build_pose(self, rot: np.ndarray, x: float, y: float, z: float) -> list:
+        """Build column-major flat pose from rotation matrix and position."""
+        return [
+            rot[0, 0], rot[1, 0], rot[2, 0], 0.0,
+            rot[0, 1], rot[1, 1], rot[2, 1], 0.0,
+            rot[0, 2], rot[1, 2], rot[2, 2], 0.0,
+            x, y, z, 1.0,
+        ]

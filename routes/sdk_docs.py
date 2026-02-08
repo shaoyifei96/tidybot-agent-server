@@ -67,7 +67,7 @@ def generate_sdk_docs() -> dict:
         "description": "Robot SDK for code execution. Import these modules in submitted code.",
         "modules": {},
         "usage": {
-            "example": """from robot_sdk import arm, base, gripper, sensors, rewind
+            "example": """from robot_sdk import arm, base, gripper, sensors, rewind, yolo
 
 # Move arm
 arm.move_joints([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
@@ -75,6 +75,20 @@ arm.move_joints([0, -0.785, 0, -2.356, 0, 1.571, 0.785])
 # Read sensors
 joints = sensors.get_arm_joints()
 print(f"Current joints: {joints}")
+
+# Detect objects with YOLO (2D)
+result = yolo.segment_camera("cup, bottle, table")
+for det in result.detections:
+    print(f"{det.class_name}: {det.confidence:.2f}, bbox={det.bbox}")
+
+# Detect objects with YOLO + depth (3D positions)
+result3d = yolo.segment_camera_3d("person, cup")
+for det in result3d.detections:
+    print(f"{det.class_name} at {det.position_3d} ({det.depth_meters:.2f}m)")
+# Get closest person
+person = result3d.get_closest("person")
+
+# Visualization at GET /yolo/visualization
 
 # Error recovery with rewind
 if rewind.is_out_of_bounds():
@@ -87,6 +101,8 @@ if rewind.is_out_of_bounds():
                 "Robot holds position when code stops (auto-hold)",
                 "Unavailable backends print warning but don't crash",
                 "Rewind coordinates arm and base together",
+                "YOLO segmentation auto-saves visualization to GET /yolo/visualization",
+                "YOLO 3D segmentation uses depth camera for object positions in meters",
             ],
         },
     }
@@ -98,6 +114,7 @@ if rewind.is_out_of_bounds():
         from robot_sdk.gripper import GripperAPI
         from robot_sdk.sensors import SensorAPI
         from robot_sdk.rewind import RewindAPI
+        from robot_sdk.yolo import YoloAPI
 
         docs["modules"]["arm"] = {
             "import": "from robot_sdk import arm",
@@ -129,6 +146,12 @@ if rewind.is_out_of_bounds():
             **get_class_info(RewindAPI),
         }
 
+        docs["modules"]["yolo"] = {
+            "import": "from robot_sdk import yolo",
+            "description": "YOLO object detection and segmentation using camera frames",
+            **get_class_info(YoloAPI),
+        }
+
         # Add constants
         docs["constants"] = {
             "arm_control_modes": {
@@ -136,8 +159,8 @@ if rewind.is_out_of_bounds():
                 "JOINT_POSITION": 1,
                 "JOINT_VELOCITY": 2,
                 "TORQUE": 3,
-                "CARTESIAN_POSE": 4,
                 "CARTESIAN_VELOCITY": 5,
+                "CARTESIAN_IMPEDANCE": 7,
             },
             "gripper_range": {
                 "min": 0,

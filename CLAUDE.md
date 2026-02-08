@@ -136,6 +136,7 @@ See `examples/` for more examples (`minimal_test.py`, `joint_move_test.py`, `pic
 3. Unavailable backends are gracefully skipped (warning printed)
 4. On completion/crash, robot holds current position (auto-hold)
 5. `print()` statements captured in `stdout`, errors in `stderr`
+6. **Auto-rewind on lease release:** When the lease is released (or expires), the robot automatically rewinds to its starting position and clears the trajectory. To run multiple code executions without rewinding in between, keep the same lease — only release it when you're done.
 
 ### Robot SDK (`robot_sdk`)
 

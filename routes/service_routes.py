@@ -267,8 +267,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
     <div style="margin-top: 12px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-        <span class="control-label">Queue (<span id="lease-queue-len">0</span> waiting)</span>
-        <button class="btn-action" id="btn-clear-queue" style="background: #b33; font-size: 11px; padding: 3px 10px;" onclick="clearQueue(this)">Stop &amp; Reset</button>
+        <span class="control-label">Queue (<span id="lease-queue-len">0</span> waiting) <span id="queue-paused-badge" class="status-badge" style="display:none; background:#ff9800; color:#000;">Paused</span></span>
+        <div style="display: flex; gap: 6px;">
+          <button class="btn-action" id="btn-pause-queue" style="background: #ff9800; color: #000; font-size: 11px; padding: 3px 10px;" onclick="togglePauseQueue(this)">Pause Queue</button>
+          <button class="btn-action" id="btn-clear-queue" style="background: #b33; font-size: 11px; padding: 3px 10px;" onclick="clearQueue(this)">Stop &amp; Reset</button>
+        </div>
       </div>
       <ul class="lease-queue-list" id="lease-queue-list">
         <li style="color: #666; font-style: italic;">Empty</li>
@@ -281,7 +284,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div style="margin-bottom: 24px;">
   <div class="control-card">
     <h3>Code Execution History</h3>
-    <div id="code-history" style="display: flex; flex-direction: column; gap: 6px;"></div>
+    <div id="code-history" style="display: flex; flex-direction: column; gap: 6px; max-height: 500px; overflow-y: auto;"></div>
   </div>
 </div>
 
@@ -548,6 +551,20 @@ async function clearQueue(btn) {
   }
 }
 
+let queuePaused = false;
+async function togglePauseQueue(btn) {
+  btn.disabled = true;
+  try {
+    const endpoint = queuePaused ? "/lease/resume-queue" : "/lease/pause-queue";
+    await fetch(endpoint, { method: "POST" });
+    await pollLease();
+  } catch (e) {
+    console.error("Failed to toggle pause queue:", e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function triggerManualRewind(btn) {
   btn.disabled = true;
   let lease = null;
@@ -718,8 +735,8 @@ function initTrajectoryCanvas() {
 }
 
 function worldToCanvas(x, y) {
-  // Map world coordinates to canvas coordinates
-  // Add padding around workspace bounds
+  // Map world coordinates to canvas: "behind the robot" view
+  // World +X (forward) → screen up, World +Y (left) → screen left
   const padding = 1.0; // 1 meter padding
   const xMin = workspaceBounds.x_min - padding;
   const xMax = workspaceBounds.x_max + padding;
@@ -728,10 +745,11 @@ function worldToCanvas(x, y) {
 
   const xRange = xMax - xMin;
   const yRange = yMax - yMin;
-  const scale = Math.min(trajectoryCanvas.width / xRange, trajectoryCanvas.height / yRange);
+  // World X range maps to canvas height, world Y range maps to canvas width
+  const scale = Math.min(trajectoryCanvas.width / yRange, trajectoryCanvas.height / xRange);
 
-  const cx = (x - xMin) * scale;
-  const cy = trajectoryCanvas.height - (y - yMin) * scale; // Flip Y axis
+  const cx = trajectoryCanvas.width - (y - yMin) * scale;   // +Y → left on screen
+  const cy = trajectoryCanvas.height - (x - xMin) * scale;  // +X → up on screen
   return { x: cx, y: cy };
 }
 
@@ -759,18 +777,20 @@ function drawTrajectory(waypoints, currentPose) {
   const yMax = workspaceBounds.y_max + padding;
 
   // Draw 1m grid lines
+  // World X maps to canvas Y → horizontal grid lines
   for (let x = Math.ceil(xMin); x <= Math.floor(xMax); x++) {
     const p = worldToCanvas(x, 0);
     ctx.beginPath();
-    ctx.moveTo(p.x, 0);
-    ctx.lineTo(p.x, h);
+    ctx.moveTo(0, p.y);
+    ctx.lineTo(w, p.y);
     ctx.stroke();
   }
+  // World Y maps to canvas X → vertical grid lines
   for (let y = Math.ceil(yMin); y <= Math.floor(yMax); y++) {
     const p = worldToCanvas(0, y);
     ctx.beginPath();
-    ctx.moveTo(0, p.y);
-    ctx.lineTo(w, p.y);
+    ctx.moveTo(p.x, 0);
+    ctx.lineTo(p.x, h);
     ctx.stroke();
   }
 
@@ -791,9 +811,11 @@ function drawTrajectory(waypoints, currentPose) {
   ctx.strokeStyle = "#f44336";
   ctx.lineWidth = 2;
   ctx.setLineDash([8, 4]);
-  const bl = worldToCanvas(workspaceBounds.x_min, workspaceBounds.y_min);
-  const tr = worldToCanvas(workspaceBounds.x_max, workspaceBounds.y_max);
-  ctx.strokeRect(bl.x, tr.y, tr.x - bl.x, bl.y - tr.y);
+  const c1 = worldToCanvas(workspaceBounds.x_min, workspaceBounds.y_min);
+  const c2 = worldToCanvas(workspaceBounds.x_max, workspaceBounds.y_max);
+  const rx = Math.min(c1.x, c2.x);
+  const ry = Math.min(c1.y, c2.y);
+  ctx.strokeRect(rx, ry, Math.abs(c2.x - c1.x), Math.abs(c2.y - c1.y));
   ctx.setLineDash([]);
 
   // Draw trajectory path
@@ -830,14 +852,15 @@ function drawTrajectory(waypoints, currentPose) {
   if (currentPose && currentPose.length >= 2) {
     const p = worldToCanvas(currentPose[0], currentPose[1]);
 
-    // Draw direction indicator
+    // Draw direction indicator (behind-robot view)
+    // World forward = (cos(theta), sin(theta)) → canvas (-sin(theta), -cos(theta))
     const theta = currentPose[2] || 0;
     const arrowLen = 15;
     ctx.strokeStyle = "#4caf50";
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(p.x, p.y);
-    ctx.lineTo(p.x + arrowLen * Math.cos(-theta + Math.PI/2), p.y + arrowLen * Math.sin(-theta + Math.PI/2));
+    ctx.lineTo(p.x - arrowLen * Math.sin(theta), p.y - arrowLen * Math.cos(theta));
     ctx.stroke();
 
     // Draw position dot
@@ -850,11 +873,11 @@ function drawTrajectory(waypoints, currentPose) {
     ctx.shadowBlur = 0;
   }
 
-  // Draw axis labels
+  // Draw axis labels (behind-robot view: X up, Y left)
   ctx.fillStyle = "#666";
   ctx.font = "11px sans-serif";
-  ctx.fillText("X", w - 15, origin.y - 5);
-  ctx.fillText("Y", origin.x + 5, 15);
+  ctx.fillText("X (fwd)", origin.x + 5, 15);
+  ctx.fillText("Y (left)", 5, origin.y - 5);
 }
 
 async function pollTrajectory() {
@@ -917,7 +940,7 @@ async function pollCodeLogs() {
 
     const [statusResp, histResp] = await Promise.all([
       fetch("/code/status"),
-      fetch("/code/history?count=3")
+      fetch("/code/history?count=10")
     ]);
     const status = await statusResp.json();
     const histData = await histResp.json();
@@ -930,61 +953,152 @@ async function pollCodeLogs() {
 
     let html = "";
 
-    // Show running indicator at top if active
+    // Show running indicator at top if active (with live output)
     if (status.is_running) {
-      html += `<div style="background: #1a2332; border: 1px solid #42a5f5; border-radius: 6px; padding: 6px 10px; font-size: 11px;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <span style="color: #42a5f5; font-weight: 600;">Running</span>
-          <span style="color: #666; font-size: 10px;">${status.execution_id || "..."}</span>
+      const dur = status.duration?.toFixed(1) || "0";
+      let liveOut = "";
+      if (status.stdout) {
+        const lines = status.stdout.trim().split("\\n").filter(l => !l.startsWith("[SDK]") && l.trim());
+        const lastLines = lines.slice(-8);
+        for (const line of lastLines) {
+          liveOut += `<div style="color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
+        }
+      }
+      if (status.stderr) {
+        const errLines = status.stderr.trim().split("\\n").filter(l => l.trim()).slice(-3);
+        for (const line of errLines) {
+          liveOut += `<div style="color: #f85149; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
+        }
+      }
+      html += `<div style="background: #1a2332; border: 1px solid #42a5f5; border-radius: 6px; padding: 8px 12px; font-size: 12px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: ${liveOut ? "6" : "0"}px;">
+          <span style="color: #42a5f5; font-weight: 600;">Running...</span>
+          <div style="display: flex; align-items: center; gap: 8px; color: #666; font-size: 10px;">
+            <span>${dur}s</span>
+            <span>&middot;</span>
+            <span style="font-family: monospace;">${status.execution_id || "..."}</span>
+          </div>
         </div>
+        ${liveOut ? `<div style="font-family: monospace; font-size: 11px; line-height: 1.5; border-top: 1px solid #30363d; padding-top: 6px;">${liveOut}</div>` : ""}
       </div>`;
     }
 
-    // Show last 3 results as rows
+    // Show results as expandable rows
     for (const r of history) {
       const ok = r.status === "completed";
-      const borderColor = ok ? "#2d5a2d" : r.status === "failed" ? "#5a2d2d" : "#5a4a2d";
-      const statusColor = ok ? "#4caf50" : r.status === "failed" ? "#f85149" : "#d29922";
-      const statusIcon = ok ? "OK" : r.status === "failed" ? "FAIL" : r.status.toUpperCase();
+      const isStopped = r.status === "stopped";
+      const isFailed = r.status === "failed";
+      const isTimeout = r.status === "timeout";
+      const borderColor = ok ? "#2d5a2d" : isFailed ? "#5a2d2d" : isStopped ? "#5a3a2d" : isTimeout ? "#5a2d2d" : "#5a4a2d";
+      const statusColor = ok ? "#4caf50" : isFailed ? "#f85149" : isStopped ? "#ff9800" : isTimeout ? "#f85149" : "#d29922";
+
+      // Status label with stop reason
+      let statusLabel = ok ? "OK" : r.status.toUpperCase();
+      if (isStopped && r.stop_reason) {
+        const reasonLabels = {
+          "manual": "STOPPED",
+          "arm_error": "ARM ERROR",
+          "idle_timeout": "IDLE TIMEOUT",
+          "max_duration": "MAX DURATION",
+          "queue_cleared": "QUEUE CLEARED",
+          "released": "RELEASED",
+        };
+        statusLabel = reasonLabels[r.stop_reason] || r.stop_reason.toUpperCase();
+      }
+
       const holder = r.holder || "unknown";
       const clientHost = r.client_host || "";
       const dur = r.duration?.toFixed(1) || "0";
+      const execId = r.execution_id || "";
 
-      // Get last few meaningful stdout lines (skip SDK init lines)
+      // Format timestamp
+      let timeStr = "";
+      if (r.started_at && r.started_at > 0) {
+        const d = new Date(r.started_at * 1000);
+        timeStr = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      }
+
+      // Get stdout/stderr lines (skip SDK init lines)
+      let allStdout = "";
       let outputLines = [];
       if (r.stdout) {
+        allStdout = r.stdout;
         outputLines = r.stdout.trim().split("\\n").filter(l => !l.startsWith("[SDK]") && l.trim());
-        outputLines = outputLines.slice(-4);  // last 4 lines
       }
+      let allStderr = "";
       let errLines = [];
-      if (!ok && r.stderr) {
-        errLines = r.stderr.trim().split("\\n").filter(l => l.trim()).slice(-2);
+      if (r.stderr) {
+        allStderr = r.stderr;
+        errLines = r.stderr.trim().split("\\n").filter(l => l.trim());
       }
 
+      // Preview: last 4 stdout lines + last 2 stderr lines
+      const previewOut = outputLines.slice(-4);
+      const previewErr = !ok ? errLines.slice(-3) : [];
+      const hasMore = outputLines.length > 4 || errLines.length > 3;
+      const detailId = "detail-" + execId;
+
       html += `<div style="background: #161b22; border: 1px solid ${borderColor}; border-radius: 6px; padding: 10px 14px; font-size: 12px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-          <div style="display: flex; align-items: center; gap: 10px;">
-            <span style="color: ${statusColor}; font-weight: 700; font-size: 13px;">${statusIcon}</span>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="color: ${statusColor}; font-weight: 700; font-size: 12px; padding: 1px 6px; background: ${statusColor}22; border-radius: 3px;">${statusLabel}</span>
             <span style="color: #e6edf3; font-weight: 600; font-size: 13px;">${holder.replace(/</g, "&lt;")}</span>
             ${clientHost ? `<span style="color: #555; font-size: 11px;">${clientHost}</span>` : ""}
           </div>
-          <div style="color: #666; font-size: 11px;">${dur}s &middot; ${r.execution_id || ""}</div>
-        </div>
-        <div style="font-family: monospace; font-size: 11px; line-height: 1.5;">`;
+          <div style="display: flex; align-items: center; gap: 8px; color: #666; font-size: 11px;">
+            ${timeStr ? `<span>${timeStr}</span><span>&middot;</span>` : ""}
+            <span>${dur}s</span>
+            <span>&middot;</span>
+            <span style="font-family: monospace;">${execId}</span>
+          </div>
+        </div>`;
 
-      // Show output lines
-      if (errLines.length > 0) {
-        for (const line of errLines) {
+      // Show error message for stopped/failed/timeout
+      if (r.error && !ok) {
+        html += `<div style="color: ${statusColor}; font-size: 11px; margin-bottom: 4px; padding: 3px 6px; background: ${statusColor}11; border-radius: 3px;">${r.error.replace(/</g, "&lt;")}</div>`;
+      }
+
+      // Output preview
+      html += `<div style="font-family: monospace; font-size: 11px; line-height: 1.5;">`;
+
+      if (previewErr.length > 0) {
+        for (const line of previewErr) {
           html += `<div style="color: #f85149; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
         }
       }
-      if (outputLines.length > 0) {
-        for (const line of outputLines) {
+      if (previewOut.length > 0) {
+        for (const line of previewOut) {
           html += `<div style="color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${line.replace(/</g, "&lt;")}</div>`;
         }
       }
 
-      html += `</div></div>`;
+      html += `</div>`;
+
+      // Expandable full output
+      if (hasMore || allStderr) {
+        html += `<details style="margin-top: 6px;">
+          <summary style="color: #58a6ff; font-size: 11px; cursor: pointer; user-select: none;">Show full output (${outputLines.length} lines${errLines.length > 0 ? ", " + errLines.length + " stderr" : ""})</summary>
+          <div style="margin-top: 6px; max-height: 300px; overflow-y: auto; background: #0d1117; border-radius: 4px; padding: 8px; border: 1px solid #30363d;">`;
+
+        if (errLines.length > 0) {
+          html += `<div style="color: #666; font-size: 10px; text-transform: uppercase; margin-bottom: 4px;">stderr:</div>`;
+          for (const line of errLines) {
+            html += `<div style="font-family: monospace; font-size: 11px; color: #f85149; white-space: pre-wrap; word-break: break-all;">${line.replace(/</g, "&lt;")}</div>`;
+          }
+          if (outputLines.length > 0) {
+            html += `<div style="border-top: 1px solid #30363d; margin: 6px 0;"></div>`;
+            html += `<div style="color: #666; font-size: 10px; text-transform: uppercase; margin-bottom: 4px;">stdout:</div>`;
+          }
+        }
+
+        for (const line of outputLines) {
+          html += `<div style="font-family: monospace; font-size: 11px; color: #8b949e; white-space: pre-wrap; word-break: break-all;">${line.replace(/</g, "&lt;")}</div>`;
+        }
+
+        html += `</div></details>`;
+      }
+
+      html += `</div>`;
     }
 
     el.innerHTML = html;
@@ -1178,6 +1292,22 @@ async function pollLease() {
       actEl.className = "activity-badge idle";
     }
 
+    // Pause queue state
+    queuePaused = !!data.paused;
+    const pauseBtn = document.getElementById("btn-pause-queue");
+    const pausedBadge = document.getElementById("queue-paused-badge");
+    if (queuePaused) {
+      pauseBtn.textContent = "Resume Queue";
+      pauseBtn.style.background = "#4caf50";
+      pauseBtn.style.color = "#fff";
+      pausedBadge.style.display = "inline";
+    } else {
+      pauseBtn.textContent = "Pause Queue";
+      pauseBtn.style.background = "#ff9800";
+      pauseBtn.style.color = "#000";
+      pausedBadge.style.display = "none";
+    }
+
     // Queue
     const queueLen = data.queue_length || 0;
     document.getElementById("lease-queue-len").textContent = queueLen;
@@ -1209,7 +1339,7 @@ setInterval(pollRewind, 500);
 setInterval(pollTrajectory, 500);
 setInterval(pollRewindLogs, 1000);
 setInterval(pollServerLogs, 2000);
-setInterval(pollCodeLogs, 2000);
+setInterval(pollCodeLogs, 1000);
 setInterval(pollLease, 1000);
 </script></body></html>"""
 

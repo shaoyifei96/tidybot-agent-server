@@ -167,7 +167,7 @@ class CameraBackendConfig:
     port: int = 5580                    # camera_server WebSocket port
     timeout: float = 10.0               # connection timeout
     auto_subscribe: bool = True         # subscribe to streams on connect
-    streams: list[str] = field(default_factory=lambda: ["color"])
+    streams: list[str] = field(default_factory=lambda: ["color", "depth"])
     stream_fps: int = 15                # streaming FPS
     quality: int = 80                   # JPEG quality for color frames
 

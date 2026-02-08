@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -37,6 +38,9 @@ class CodeStatusResponse(BaseModel):
     execution_id: Optional[str]
     status: ExecutionStatus
     is_running: bool
+    stdout: str = ""
+    stderr: str = ""
+    duration: float = 0.0
 
 
 class CodeResultResponse(BaseModel):
@@ -207,7 +211,7 @@ def init_code_routes(lease_manager: LeaseManager):
             )
 
         logger.info(f"Stopping code execution for lease {x_lease_id}")
-        stopped = executor.stop()
+        stopped = executor.stop(reason="manual")
 
         if stopped:
             return CodeStopResponse(
@@ -224,14 +228,23 @@ def init_code_routes(lease_manager: LeaseManager):
     async def get_status():
         """Get current execution status.
 
-        Returns execution ID, status, and whether code is running.
+        Returns execution ID, status, whether code is running, and live output.
         No lease required (read-only).
         """
         executor = get_executor()
+        stdout, stderr = "", ""
+        duration = 0.0
+        if executor.is_running:
+            stdout, stderr = executor.get_current_output()
+            if executor._start_time:
+                duration = time.time() - executor._start_time
         return CodeStatusResponse(
             execution_id=executor._execution_id,
             status=executor.status,
             is_running=executor.is_running,
+            stdout=stdout,
+            stderr=stderr,
+            duration=duration,
         )
 
     @router.get("/result", response_model=CodeResultResponse)

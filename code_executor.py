@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -40,6 +41,8 @@ class ExecutionResult:
     error: str = ""
     holder: str = ""
     client_host: str = ""
+    stop_reason: str = ""
+    started_at: float = 0.0
 
 
 @dataclass
@@ -271,6 +274,10 @@ class CodeExecutor:
         self._last_result: Optional[ExecutionResult] = None
         self._history: List[ExecutionResult] = []  # Last N results
         self._temp_files: list[Path] = []
+        # Incremental output capture (thread-safe)
+        self._stdout_lines: List[str] = []
+        self._stderr_lines: List[str] = []
+        self._output_lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
@@ -301,6 +308,35 @@ class CodeExecutor:
         if self._last_result:
             return self._last_result.status
         return ExecutionStatus.IDLE
+
+    def _read_stream(self, stream, target: str) -> None:
+        """Read from a stream line-by-line and accumulate into target list.
+
+        Runs in a background thread. Reads until EOF.
+
+        Args:
+            stream: File-like object (process.stdout or process.stderr)
+            target: "stdout" or "stderr" to select accumulator
+        """
+        try:
+            for line in stream:
+                with self._output_lock:
+                    if target == "stdout":
+                        self._stdout_lines.append(line)
+                    else:
+                        self._stderr_lines.append(line)
+        except (ValueError, OSError):
+            # Stream closed
+            pass
+
+    def get_current_output(self) -> Tuple[str, str]:
+        """Get accumulated output so far (works during and after execution).
+
+        Returns:
+            Tuple of (stdout, stderr) strings
+        """
+        with self._output_lock:
+            return "".join(self._stdout_lines), "".join(self._stderr_lines)
 
     async def execute(
         self,
@@ -344,10 +380,15 @@ class CodeExecutor:
 
         logger.info(f"Executing code (ID: {execution_id}): {temp_file}")
 
+        # Reset output accumulators
+        with self._output_lock:
+            self._stdout_lines.clear()
+            self._stderr_lines.clear()
+
         try:
             # Start subprocess
             self._process = subprocess.Popen(
-                ["python3", str(temp_file)],
+                ["python3", "-u", str(temp_file)],  # -u for unbuffered output
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -359,15 +400,44 @@ class CodeExecutor:
             # while we're awaiting, so we need a stable reference.
             process = self._process
 
-            # Wait for completion or timeout
-            # Use asyncio.to_thread to avoid blocking the event loop
-            # This allows the server to handle other requests (like rewind API calls
-            # from the subprocess) while waiting for the code to complete
+            # Start reader threads for incremental output capture
+            stdout_thread = threading.Thread(
+                target=self._read_stream, args=(process.stdout, "stdout"), daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=self._read_stream, args=(process.stderr, "stderr"), daemon=True
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            # Wait for completion or timeout (non-blocking to event loop)
             try:
-                stdout, stderr = await asyncio.to_thread(
-                    process.communicate, timeout=timeout
+                exit_code = await asyncio.to_thread(process.wait, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                await asyncio.to_thread(process.wait)
+                # Wait for readers to finish consuming remaining output
+                stdout_thread.join(timeout=2.0)
+                stderr_thread.join(timeout=2.0)
+                stdout, stderr = self.get_current_output()
+                duration = time.time() - self._start_time
+
+                result = ExecutionResult(
+                    status=ExecutionStatus.TIMEOUT,
+                    execution_id=execution_id,
+                    exit_code=None,
+                    stdout=stdout,
+                    stderr=stderr,
+                    duration=duration,
+                    error=f"Execution timed out after {timeout}s",
+                    stop_reason="timeout",
+                    started_at=self._start_time,
                 )
-                exit_code = process.returncode
+            else:
+                # Process exited normally - wait for readers to finish
+                stdout_thread.join(timeout=5.0)
+                stderr_thread.join(timeout=5.0)
+                stdout, stderr = self.get_current_output()
                 duration = time.time() - self._start_time
 
                 if exit_code == 0:
@@ -385,22 +455,7 @@ class CodeExecutor:
                     stderr=stderr,
                     duration=duration,
                     error=error,
-                )
-
-            except subprocess.TimeoutExpired:
-                # Kill process on timeout
-                process.kill()
-                stdout, stderr = await asyncio.to_thread(process.communicate)
-                duration = time.time() - self._start_time
-
-                result = ExecutionResult(
-                    status=ExecutionStatus.TIMEOUT,
-                    execution_id=execution_id,
-                    exit_code=None,
-                    stdout=stdout,
-                    stderr=stderr,
-                    duration=duration,
-                    error=f"Execution timed out after {timeout}s",
+                    started_at=self._start_time,
                 )
 
         except Exception as e:
@@ -414,6 +469,7 @@ class CodeExecutor:
                 stderr=str(e),
                 duration=duration,
                 error=f"Failed to execute code: {e}",
+                started_at=self._start_time or 0.0,
             )
 
         finally:
@@ -439,10 +495,18 @@ class CodeExecutor:
 
         return result
 
-    def stop(self) -> bool:
+    def stop(self, reason: str = "manual") -> bool:
         """Stop currently running code.
 
         Sends SIGTERM for graceful shutdown, then SIGKILL if needed.
+
+        Args:
+            reason: Why the execution was stopped. Common values:
+                - "manual": User explicitly stopped via /code/stop
+                - "arm_error": Arm server crashed (ArmMonitor auto-recovery)
+                - "idle_timeout": Lease expired due to idle timeout
+                - "max_duration": Lease expired due to max duration
+                - "queue_cleared": Lease revoked via queue clear
 
         Returns:
             True if code was stopped, False if nothing was running
@@ -450,7 +514,7 @@ class CodeExecutor:
         if not self.is_running:
             return False
 
-        logger.info(f"Stopping execution {self._execution_id}")
+        logger.info(f"Stopping execution {self._execution_id} (reason: {reason})")
 
         # Try graceful shutdown first
         self._process.terminate()
@@ -466,11 +530,19 @@ class CodeExecutor:
 
         duration = time.time() - self._start_time if self._start_time else 0
 
-        # Capture any output
-        try:
-            stdout, stderr = self._process.communicate(timeout=0.5)
-        except:
-            stdout, stderr = "", ""
+        # Give reader threads a moment to flush, then grab accumulated output
+        time.sleep(0.1)
+        stdout, stderr = self.get_current_output()
+
+        # Human-readable error messages
+        reason_messages = {
+            "manual": "Stopped by user",
+            "arm_error": "Stopped: arm server crashed (auto-recovering)",
+            "idle_timeout": "Stopped: lease expired (idle timeout — no commands sent)",
+            "max_duration": "Stopped: lease expired (max duration reached)",
+            "queue_cleared": "Stopped: lease revoked (queue cleared)",
+        }
+        error_msg = reason_messages.get(reason, f"Stopped: {reason}")
 
         self._last_result = ExecutionResult(
             status=ExecutionStatus.STOPPED,
@@ -479,7 +551,9 @@ class CodeExecutor:
             stdout=stdout,
             stderr=stderr,
             duration=duration,
-            error="Execution stopped by user",
+            error=error_msg,
+            stop_reason=reason,
+            started_at=self._start_time or 0.0,
         )
 
         self._process = None
@@ -526,7 +600,7 @@ from backends.franka import FrankaBackend
 from backends.base import BaseBackend
 from backends.gripper import GripperBackend
 from config import FrankaBackendConfig, BaseBackendConfig, GripperBackendConfig
-from robot_sdk import ArmAPI, BaseAPI, GripperAPI, SensorAPI
+from robot_sdk import ArmAPI, BaseAPI, GripperAPI, SensorAPI, YoloAPI
 import robot_sdk
 
 # Create backend configurations (use environment variables or defaults)
@@ -596,12 +670,27 @@ lease_id = os.getenv("ROBOT_LEASE_ID")
 robot_sdk.rewind = RewindAPI(server_url=server_url, lease_id=lease_id)
 print(f"[SDK] Rewind API initialized (server: {{server_url}})")
 
+# Initialize YOLO API (uses HTTP calls to remote YOLO server + agent server cameras)
+from robot_sdk.yolo import YoloAPI
+robot_sdk.yolo = YoloAPI(
+    yolo_server_url="http://158.130.109.188:8010",
+    agent_server_url=server_url,
+)
+print("[SDK] YOLO API initialized")
+
+# Initialize display API (uses HTTP calls to agent server)
+from robot_sdk.display import DisplayAPI
+robot_sdk.display = DisplayAPI(server_url=server_url)
+print("[SDK] Display API initialized")
+
 # Make them available for import
 arm = robot_sdk.arm
 base = robot_sdk.base
 gripper = robot_sdk.gripper
 sensors = robot_sdk.sensors
 rewind = robot_sdk.rewind
+yolo = robot_sdk.yolo
+display = robot_sdk.display
 
 # Also expose backends directly for advanced usage
 # (same pattern as rewind orchestrator uses)
@@ -666,6 +755,9 @@ asyncio.run(cleanup())
         if python_path:
             paths.append(python_path)
         env["PYTHONPATH"] = ":".join(paths)
+
+        # Ensure Python output is unbuffered for real-time log capture
+        env["PYTHONUNBUFFERED"] = "1"
 
         # Add lease ID and server URL for rewind API
         if hasattr(self, "_lease_id") and self._lease_id:

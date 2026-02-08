@@ -27,6 +27,8 @@ from robot_sdk.base import BaseAPI
 from robot_sdk.gripper import GripperAPI
 from robot_sdk.sensors import SensorAPI
 from robot_sdk.rewind import RewindAPI
+from robot_sdk.yolo import YoloAPI
+from robot_sdk.display import DisplayAPI
 
 # Global instances (initialized by CodeExecutor before running submitted code)
 arm: ArmAPI = None  # type: ignore
@@ -34,5 +36,7 @@ base: BaseAPI = None  # type: ignore
 gripper: GripperAPI = None  # type: ignore
 sensors: SensorAPI = None  # type: ignore
 rewind: RewindAPI = None  # type: ignore
+yolo: YoloAPI = None  # type: ignore
+display: DisplayAPI = None  # type: ignore
 
-__all__ = ["arm", "base", "gripper", "sensors", "rewind", "ArmAPI", "BaseAPI", "GripperAPI", "SensorAPI", "RewindAPI"]
+__all__ = ["arm", "base", "gripper", "sensors", "rewind", "yolo", "display", "ArmAPI", "BaseAPI", "GripperAPI", "SensorAPI", "RewindAPI", "YoloAPI", "DisplayAPI"]

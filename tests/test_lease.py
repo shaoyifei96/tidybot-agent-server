@@ -21,10 +21,10 @@ async def test_lease_status_visibility():
         check_interval_s=1.0,
     )
 
-    def motors_moving():
-        return False
+    def last_moved_at():
+        return 0.0
 
-    lease_mgr = LeaseManager(config, motors_moving)
+    lease_mgr = LeaseManager(config, last_moved_at)
     await lease_mgr.start()
 
     try:

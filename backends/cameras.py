@@ -54,9 +54,13 @@ class CameraBackend:
         self._connected = False
         self._streaming = False
         
-        # Frame cache for HTTP endpoint
-        self._frame_cache: Dict[str, bytes] = {}  # device_id -> JPEG bytes
+        # Frame cache for HTTP endpoint: device_id -> (JPEG bytes, timestamp)
+        self._frame_cache: Dict[str, tuple] = {}  # device_id -> (bytes, float)
         self._frame_lock = threading.Lock()
+        self._frame_max_age = 2.0  # seconds before considering cached frame stale
+
+        # Intrinsics cache (fetched once at startup, before streaming thread)
+        self._intrinsics_cache: Dict[str, Dict[str, Any]] = {}  # device_id -> intrinsics
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -82,16 +86,20 @@ class CameraBackend:
             )
             
             if not self._client.connect():
-                logger.error("CameraBackend: failed to connect to camera server")
+                logger.debug("CameraBackend: failed to connect to camera server")
                 self._client = None
                 return
             
             self._connected = True
             logger.info("CameraBackend: connected to %s:%d", self._cfg.host, self._cfg.port)
-            
+
+            # Fetch and cache intrinsics BEFORE starting streaming thread
+            # (streaming starts a recv thread that races with synchronous calls)
+            self._cache_intrinsics()
+
             # Set up frame callback for caching
             self._client.set_frame_callback(self._on_frame)
-            
+
             # Subscribe to streams
             if self._cfg.auto_subscribe:
                 self._client.subscribe(
@@ -126,67 +134,118 @@ class CameraBackend:
         """Return True if connected to camera server."""
         return self._dry_run or self._connected
 
+    def _cache_intrinsics(self) -> None:
+        """Fetch intrinsics for all cameras and cache them.
+
+        Must be called before subscribe() starts the recv thread.
+        """
+        if not self._client or not self._client.latest_state:
+            return
+
+        for cam in self._client.latest_state.cameras:
+            try:
+                intrinsics = self._client.get_intrinsics("color", cam.device_id)
+                if intrinsics:
+                    self._intrinsics_cache[cam.device_id] = intrinsics
+                    logger.info("CameraBackend: cached intrinsics for %s (%s)",
+                               cam.name, cam.device_id)
+            except Exception as e:
+                logger.warning("CameraBackend: failed to get intrinsics for %s: %s",
+                               cam.name, e)
+
     # -- frame callback ------------------------------------------------------
 
     def _on_frame(self, frame: DecodedFrame) -> None:
-        """Callback for received frames - cache as JPEG."""
+        """Callback for received frames - cache as JPEG (color) or PNG (depth)."""
         if not CV2_AVAILABLE:
             return
-        
+
         try:
+            now = time.time()
             if frame.stream_type == "color":
-                # Encode as JPEG for HTTP endpoint
                 encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._cfg.quality]
                 _, jpeg = cv2.imencode(".jpg", frame.frame, encode_params)
                 with self._frame_lock:
-                    self._frame_cache[frame.device_id] = jpeg.tobytes()
+                    self._frame_cache[frame.device_id] = (jpeg.tobytes(), now)
+            elif frame.stream_type == "depth":
+                _, png = cv2.imencode(".png", frame.frame)
+                with self._frame_lock:
+                    self._frame_cache[f"{frame.device_id}:depth"] = (png.tobytes(), now)
         except Exception as e:
             logger.error("CameraBackend: error encoding frame: %s", e)
 
     # -- queries -------------------------------------------------------------
 
+    def _encode_decoded_frame(self, decoded: "DecodedFrame") -> Optional[bytes]:
+        """Encode a DecodedFrame to JPEG bytes."""
+        if not CV2_AVAILABLE or decoded is None:
+            return None
+        try:
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._cfg.quality]
+            _, jpeg = cv2.imencode(".jpg", decoded.frame, encode_params)
+            return jpeg.tobytes()
+        except Exception as e:
+            logger.error("CameraBackend: error encoding frame: %s", e)
+            return None
+
     def get_frame(self, device: Optional[str] = None) -> Optional[bytes]:
         """Get latest frame as JPEG bytes.
-        
+
+        Returns a fresh frame from the streaming cache. If the cached frame
+        is stale (older than _frame_max_age), falls back to the CameraClient's
+        own frame buffer and re-encodes on the fly.
+
         Args:
             device: Device ID, or None for first available
-            
+
         Returns:
             JPEG bytes or None
         """
         if self._dry_run:
             return None
-        
-        # Try cached frame first (from streaming)
+
+        now = time.time()
+
+        # Try cached pre-encoded frame (from streaming callback)
         with self._frame_lock:
             if device:
-                if device in self._frame_cache:
-                    return self._frame_cache[device]
+                entry = self._frame_cache.get(device)
+                if entry:
+                    data, ts = entry
+                    if now - ts < self._frame_max_age:
+                        return data
             else:
-                for v in self._frame_cache.values():
-                    return v
-        
-        # No cached frame, try to get one directly
+                for key, entry in self._frame_cache.items():
+                    if ":" in key:  # skip depth entries (device_id:depth)
+                        continue
+                    data, ts = entry
+                    if now - ts < self._frame_max_age:
+                        return data
+
+        # Cache is stale or empty — fall back to CameraClient's latest_frames
+        # (updated directly by recv thread, no extra callback needed).
+        # Note: DecodedFrame.timestamp is RealSense hardware time, not system time,
+        # so we can't compare it with time.time(). Just use whatever the client has.
         if self._client and self._connected:
-            try:
-                frame = self._client.get_frame("color", device or "any", self._cfg.quality)
-                if frame and CV2_AVAILABLE:
-                    encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._cfg.quality]
-                    _, jpeg = cv2.imencode(".jpg", frame.frame, encode_params)
-                    return jpeg.tobytes()
-            except Exception as e:
-                logger.error("CameraBackend: error getting frame: %s", e)
-        
+            decoded = self._client.get_latest_frame("color", device)
+            if decoded is not None:
+                logger.debug("CameraBackend: using CameraClient fallback frame for device=%s", device)
+                jpeg = self._encode_decoded_frame(decoded)
+                if jpeg:
+                    return jpeg
+
+        logger.debug("CameraBackend: no fresh frame available for device=%s", device)
         return None
 
     def get_all_frames(self) -> Dict[str, bytes]:
-        """Get all cached frames.
-        
+        """Get all cached color frames (bytes only, no timestamps).
+
         Returns:
             Dict of device_id -> JPEG bytes
         """
         with self._frame_lock:
-            return dict(self._frame_cache)
+            return {k: v[0] for k, v in self._frame_cache.items()
+                    if ":" not in k}  # exclude depth entries (device_id:depth)
 
     def get_state(self) -> Optional[Dict[str, Any]]:
         """Get camera state.
@@ -221,6 +280,33 @@ class CameraBackend:
         if self._client and self._client.latest_state:
             return [c.to_dict() for c in self._client.latest_state.cameras]
         return []
+
+    def get_intrinsics(
+        self,
+        device_id: Optional[str] = None,
+        stream_type: str = "color",
+    ) -> Optional[Dict[str, Any]]:
+        """Get camera intrinsics (focal length, principal point, etc.).
+
+        Returns cached intrinsics (fetched at startup). No blocking I/O.
+
+        Args:
+            device_id: Camera device ID, or None for first available
+            stream_type: Stream type ("color" or "depth")
+
+        Returns:
+            Dict with {fx, fy, ppx, ppy, width, height, depth_scale, ...} or None
+        """
+        if self._dry_run:
+            return None
+
+        if device_id:
+            return self._intrinsics_cache.get(device_id)
+
+        # Return first available
+        for v in self._intrinsics_cache.values():
+            return v
+        return None
 
     def get_latest_decoded_frame(
         self, 

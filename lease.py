@@ -36,16 +36,17 @@ class LeaseManager:
     def __init__(
         self,
         config: LeaseConfig,
-        motors_moving_fn: Callable[[], bool],
+        last_moved_at_fn: Callable[[], float],
         on_lease_event: Callable[[dict], None] | None = None,
     ) -> None:
         self._cfg = config
-        self._motors_moving = motors_moving_fn
+        self._last_moved_at = last_moved_at_fn
         self._on_event = on_lease_event or (lambda e: None)
         self._current: Lease | None = None
         self._queue: deque[QueueEntry] = deque()
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._paused: bool = False
 
         # Reset-on-release state
         self._resetting: bool = False
@@ -90,7 +91,7 @@ class LeaseManager:
 
     async def acquire(self, holder: str) -> dict:
         async with self._lock:
-            if self._current is None and not self._resetting:
+            if self._current is None and not self._resetting and not self._paused:
                 return self._grant(holder)
             # Already holder?
             if self._current and self._current.holder == holder:
@@ -118,7 +119,7 @@ class LeaseManager:
                 if self._cfg.reset_on_release and self._on_lease_end_async:
                     self._resetting = True
                     self._reset_task = asyncio.create_task(
-                        self._do_reset_and_grant()
+                        self._do_reset_and_grant(reason="released")
                     )
                     return {"status": "released", "resetting": True}
                 else:
@@ -172,12 +173,21 @@ class LeaseManager:
         queue_list = [{"position": i + 1, "holder": entry.holder}
                       for i, entry in enumerate(self._queue)]
 
+        config = {
+            "max_duration_s": self._cfg.max_duration_s,
+            "idle_timeout_s": self._cfg.idle_timeout_s,
+            "warning_grace_s": self._cfg.warning_grace_s,
+            "reset_on_release": self._cfg.reset_on_release,
+        }
+
         if self._current is None:
             return {
                 "holder": None,
                 "queue_length": len(self._queue),
                 "queue": queue_list,
                 "resetting": self._resetting,
+                "paused": self._paused,
+                "config": config,
             }
         return {
             "holder": self._current.holder,
@@ -185,7 +195,25 @@ class LeaseManager:
             "queue_length": len(self._queue),
             "queue": queue_list,
             "resetting": self._resetting,
+            "paused": self._paused,
+            "config": config,
         }
+
+    async def pause_queue(self) -> dict:
+        """Pause queue progression — no queued holders will be granted."""
+        async with self._lock:
+            self._paused = True
+            logger.info("Lease queue paused")
+            return {"status": "paused"}
+
+    async def resume_queue(self) -> dict:
+        """Resume queue progression and grant next if nobody holds the lease."""
+        async with self._lock:
+            self._paused = False
+            logger.info("Lease queue resumed")
+            if self._current is None and not self._resetting:
+                self._try_grant_next()
+            return {"status": "resumed"}
 
     # -- internals -----------------------------------------------------------
 
@@ -216,6 +244,8 @@ class LeaseManager:
         return max(0.0, self._cfg.max_duration_s - elapsed)
 
     def _try_grant_next(self) -> None:
+        if self._paused:
+            return
         while self._queue:
             entry = self._queue.popleft()
             if not entry.future.done():
@@ -233,24 +263,24 @@ class LeaseManager:
         if self._cfg.reset_on_release and self._on_lease_end_async:
             self._resetting = True
             self._reset_task = asyncio.create_task(
-                self._do_reset_and_grant()
+                self._do_reset_and_grant(reason=reason)
             )
         else:
             self._try_grant_next()
 
-    async def _do_reset_and_grant(self) -> None:
+    async def _do_reset_and_grant(self, reason: str = "released") -> None:
         """Rewind to home, clear trajectory, then grant next queued client."""
         try:
             self._on_event({"type": "resetting_to_home"})
-            logger.info("Lease ended — resetting robot to home")
+            logger.info("Lease ended — resetting robot to home (reason: %s)", reason)
 
             # Stop any running code execution
             try:
                 from routes.code_routes import get_executor
                 executor = get_executor()
                 if executor.is_running:
-                    logger.info("Stopping running code execution before reset")
-                    executor.stop()
+                    logger.info("Stopping running code execution before reset (reason: %s)", reason)
+                    executor.stop(reason=reason)
             except Exception as e:
                 logger.warning("Failed to stop code executor: %s", e)
 
@@ -283,11 +313,11 @@ class LeaseManager:
                     self._revoke("max_duration")
                     continue
 
-                # Idle check
-                idle_s = now - self._current.last_cmd_at
-                is_active = self._motors_moving()
+                # Idle check — use most recent activity (command or movement)
+                last_activity = max(self._current.last_cmd_at, self._last_moved_at())
+                idle_s = now - last_activity
 
-                if idle_s >= self._cfg.idle_timeout_s and not is_active:
+                if idle_s >= self._cfg.idle_timeout_s:
                     if not self._current.warned:
                         self._current.warned = True
                         self._on_event({

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
@@ -25,6 +26,7 @@ from backends.franka import FrankaBackend
 from backends.gripper import GripperBackend
 from config import LeaseConfig, ServerConfig, ServiceManagerConfig, default_services
 from lease import LeaseManager
+from display_state import DisplayBroadcaster
 from routes.ws import FeedbackBroadcaster
 from arm_monitor import ArmMonitor
 from safety import SafetyEnvelope
@@ -63,6 +65,7 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     state_agg = StateAggregator(cfg, base_backend, franka_backend, gripper_backend, camera_backend)
     safety = SafetyEnvelope(cfg.safety)
     feedback = FeedbackBroadcaster()
+    display = DisplayBroadcaster()
 
     # Unified state logger (replaces TrajectoryRecorder)
     logger_config = LoggerConfig(
@@ -105,7 +108,7 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
 
     lease_mgr = LeaseManager(
         cfg.lease,
-        motors_moving_fn=state_agg.motors_moving,
+        last_moved_at_fn=state_agg.last_moved_at,
         on_lease_event=feedback.broadcast,
     )
 
@@ -120,6 +123,12 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
 
         lease_mgr.set_on_lease_end(_on_lease_end)
 
+    # Wire lease-start callback: clear stale waypoints so trajectory is clean
+    def _on_lease_start():
+        system_logger.clear()
+
+    lease_mgr.set_on_lease_start(_on_lease_start)
+
     # -- routes --------------------------------------------------------------
     from routes.commands import create_router as cmd_router
     from routes.lease_routes import create_router as lease_router
@@ -128,6 +137,8 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     from routes.ws import create_router as ws_router
     from routes.code_routes import init_code_routes
     from routes.sdk_docs import router as sdk_docs_router
+    from routes.yolo_routes import router as yolo_router
+    from routes.display_routes import create_router as display_router
 
     app.include_router(state_router(state_agg, camera_backend, lease_mgr, base_backend, franka_backend, gripper_backend, system_logger))
     app.include_router(lease_router(lease_mgr))
@@ -136,6 +147,8 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
     app.include_router(ws_router(state_agg, feedback, cfg, camera_backend))
     app.include_router(init_code_routes(lease_mgr))
     app.include_router(sdk_docs_router)
+    app.include_router(yolo_router)
+    app.include_router(display_router(display))
 
     # Service manager routes (includes dashboard)
     if cfg.dashboard:
@@ -186,6 +199,39 @@ def build_app(cfg: ServerConfig, service_mgr: ServiceManager | None = None) -> F
 
         # Start arm crash recovery monitor
         await arm_monitor.start()
+
+        # Start display status polling (1 Hz)
+        async def _display_status_loop():
+            from routes.code_routes import get_executor
+            prev_running = False
+            while True:
+                try:
+                    executor = get_executor()
+                    is_running = executor.is_running
+                    lease_status = lease_mgr.status()
+                    queue_length = lease_status.get("queue_length", 0)
+                    holder = lease_status.get("holder", "") or ""
+
+                    if rewind_orchestrator.is_rewinding:
+                        status = "rewinding"
+                    elif is_running:
+                        status = "executing"
+                    else:
+                        status = "idle"
+
+                    display.update_robot_status(status, queue_length, holder)
+
+                    # Auto-clear display content when execution ends
+                    if prev_running and not is_running:
+                        display.on_execution_ended()
+                    prev_running = is_running
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+        task = asyncio.create_task(_display_status_loop())
+        app.state.background_tasks.add(task)
+        task.add_done_callback(app.state.background_tasks.discard)
 
         logger.info("Hardware server ready on %s:%d", cfg.host, cfg.port)
 
